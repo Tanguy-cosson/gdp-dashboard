@@ -6,20 +6,24 @@ import plotly.express as px
 import streamlit as st
 
 from audit import log_audit
-from auth import sidebar_user_identification
+from auth import (generate_temp_password, handle_password_reset_flow, hash_password,
+                   sidebar_user_identification, validate_password_complexity)
 from automation import check_and_send_reminders
 from barcode_utils import (decode_barcode_from_image, generate_barcode_png,
                             generate_sample_label_pdf, zbar_available)
 from business_logic import (build_patients_matrix, compute_oor_flag, compute_tat_hours,
                              validate_ingestion_dataframe)
-from constants import (CRITICAL_FLAG, NORMAL_FLAG, OOR_FLAG, PAGE_PERMISSIONS,
-                        ROLE_LABELS, SIGNATURE_REASONS, STUDYID)
-from db import (add_storage_location, count_by_status, find_sample_by_barcode,
-                get_connection, get_current_storage_location, get_or_create_patient,
-                get_or_create_sample, get_or_create_site, get_or_create_visit,
-                get_samples_pending_labels, get_setting, insert_lab_result, insert_remark,
+from cdisc_export import generate_define_xml, generate_dm_domain
+from constants import (ALL_ROLES, CRITICAL_FLAG, ESIGNATURE_LEGAL_NOTICE, NORMAL_FLAG,
+                        OOR_FLAG, PAGE_PERMISSIONS, ROLE_LABELS, SIGNATURE_REASONS, STUDYID)
+from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_status,
+                create_user, find_sample_by_barcode, get_connection,
+                get_current_storage_location, get_or_create_patient, get_or_create_sample,
+                get_or_create_site, get_or_create_visit, get_samples_pending_labels,
+                get_setting, insert_lab_result, insert_remark, list_users,
                 mark_biological_validation, mark_labels_printed, mark_technical_validation,
-                read_audit_trail, read_full_results, read_remarks, set_setting)
+                read_audit_trail, read_full_results, read_remarks, set_setting,
+                set_user_active, set_user_role, username_exists)
 from pdf_reports import generate_patient_pdf_report, generate_vinc_pdf_report
 from ui import _html, inject_custom_css, kpi_card, render_landing_page, render_top_banner
 
@@ -361,6 +365,8 @@ def page_biological_validation(conn, user_name):
     st.markdown("---")
     st.subheader("🖋 Signature Électronique (21 CFR Part 11)")
 
+    st.info(f"ℹ️ {ESIGNATURE_LEGAL_NOTICE}")
+
     with st.form("form_esignature_bio"):
         reason = st.selectbox("Meaning of this signature", SIGNATURE_REASONS)
         remarks = st.text_area("Remarques / observations",
@@ -617,28 +623,144 @@ def page_patient_records(conn, user_name, role):
 
 
 def page_export_sdtm(conn, user_name):
-    st.title("CDISC SDTM EXPORT – LB Domain")
-    df = read_full_results(conn)
-    if df.empty:
-        st.info("No data to export.")
-        return
+    st.title("CDISC SDTM EXPORT")
+    st.caption("LB (Laboratory) and DM (Demographics) domains, plus a starter define.xml. "
+                "See the Define-XML file itself for the disclaimer on what still needs to be "
+                "completed before a real regulatory submission.")
 
-    df = df.sort_values(["usubjid", "visit_num", "test_code"]).copy()
-    df["LBSEQ"] = df.groupby("usubjid").cumcount() + 1
-    sdtm = pd.DataFrame({
-        "STUDYID": STUDYID, "DOMAIN": "LB", "USUBJID": df["usubjid"], "LBSEQ": df["LBSEQ"],
-        "LBTESTCD": df["test_code"], "LBTEST": df["test_name"],
-        "LBORRES": df["result_value"].astype(str), "LBORRESU": df["result_unit"],
-        "LBSTRESN": df["result_value"], "LBSTRESU": df["result_unit"],
-        "VISITNUM": df["visit_num"], "VISIT": df["visit_code"], "LBDTC": df["result_date"],
-    })
-    st.dataframe(sdtm, use_container_width=True)
+    tab_lb, tab_dm, tab_define = st.tabs(["LB domain", "DM domain", "define.xml"])
 
-    csv_buffer = io.StringIO()
-    sdtm.to_csv(csv_buffer, index=False)
-    if st.download_button("Download the LB domain (CSV)", csv_buffer.getvalue(),
-                            file_name=f"SDTM_LB_BLOOD_{date.today()}.csv"):
-        log_audit(conn, "LAB_RESULTS", "EXPORT_SDTM_LB", user_name, comment=f"{len(sdtm)} lignes")
+    with tab_lb:
+        df = read_full_results(conn)
+        if df.empty:
+            st.info("No data to export.")
+        else:
+            df = df.sort_values(["usubjid", "visit_num", "test_code"]).copy()
+            df["LBSEQ"] = df.groupby("usubjid").cumcount() + 1
+            sdtm = pd.DataFrame({
+                "STUDYID": STUDYID, "DOMAIN": "LB", "USUBJID": df["usubjid"], "LBSEQ": df["LBSEQ"],
+                "LBTESTCD": df["test_code"], "LBTEST": df["test_name"],
+                "LBORRES": df["result_value"].astype(str), "LBORRESU": df["result_unit"],
+                "LBSTRESN": df["result_value"], "LBSTRESU": df["result_unit"],
+                "VISITNUM": df["visit_num"], "VISIT": df["visit_code"], "LBDTC": df["result_date"],
+            })
+            st.dataframe(sdtm, use_container_width=True)
+            csv_buffer = io.StringIO()
+            sdtm.to_csv(csv_buffer, index=False)
+            if st.download_button("Download LB domain (CSV)", csv_buffer.getvalue(),
+                                    file_name=f"SDTM_LB_BLOOD_{date.today()}.csv", key="dl_lb"):
+                log_audit(conn, "LAB_RESULTS", "EXPORT_SDTM_LB", user_name, comment=f"{len(sdtm)} lignes")
+
+    with tab_dm:
+        dm = generate_dm_domain(conn)
+        if dm.empty:
+            st.info("No data to export.")
+        else:
+            st.dataframe(dm, use_container_width=True)
+            csv_buffer = io.StringIO()
+            dm.to_csv(csv_buffer, index=False)
+            if st.download_button("Download DM domain (CSV)", csv_buffer.getvalue(),
+                                    file_name=f"SDTM_DM_BLOOD_{date.today()}.csv", key="dl_dm"):
+                log_audit(conn, "PATIENTS", "EXPORT_SDTM_DM", user_name, comment=f"{len(dm)} lignes")
+
+    with tab_define:
+        st.caption("Starter Define-XML v2.0 covering LB and DM as implemented in this app. "
+                    "Complete CodeLists/MethodDefs/Comments and validate with Pinnacle 21 "
+                    "(or equivalent) before any real regulatory submission.")
+        define_bytes = generate_define_xml()
+        if st.download_button("Download define.xml", define_bytes,
+                                file_name="define.xml", mime="application/xml", key="dl_define"):
+            log_audit(conn, "SETTINGS", "EXPORT_DEFINE_XML", user_name)
+
+
+def page_user_management(conn, user_name):
+    """Réservée au CRO : création, désactivation, changement de rôle,
+    réinitialisation de mot de passe. Sans cette page, la seule façon
+    d'ajouter un utilisateur était d'éditer schema.sql à la main."""
+    st.title("USER MANAGEMENT")
+    st.caption("Manage accounts for all roles. Passwords are never shown except once, "
+                "right after creation or reset — write it down or share it securely, "
+                "it cannot be retrieved again.")
+
+    users_df = list_users(conn)
+    st.subheader("Existing accounts")
+    display_df = users_df.copy()
+    display_df["status"] = display_df.apply(
+        lambda r: ("🔒 Locked" if r["locked_until"] else
+                   ("⛔ Inactive" if not r["active"] else "✅ Active")), axis=1)
+    st.dataframe(
+        display_df[["username", "full_name", "role", "email", "status", "must_change_password", "created_at"]],
+        use_container_width=True, hide_index=True,
+    )
+
+    st.markdown("---")
+    col_create, col_manage = st.columns(2)
+
+    with col_create:
+        st.subheader("Create a new account")
+        with st.form("create_user_form"):
+            new_username = st.text_input("Username")
+            new_full_name = st.text_input("Full name")
+            new_role = st.selectbox("Role", ALL_ROLES, format_func=lambda r: ROLE_LABELS.get(r, r))
+            new_email = st.text_input("E-mail (required for password reset / alerts)")
+            submitted = st.form_submit_button("Create account")
+            if submitted:
+                if not new_username or not new_full_name:
+                    st.error("Username and full name are required.")
+                elif username_exists(conn, new_username):
+                    st.error(f"Username '{new_username}' already exists.")
+                else:
+                    temp_password = generate_temp_password()
+                    create_user(conn, new_username, new_full_name, new_role, new_email,
+                                hash_password(temp_password))
+                    log_audit(conn, "USERS", "USER_CREATED", user_name, record_ref=new_username,
+                              comment=f"role={new_role}")
+                    st.success(f"Account '{new_username}' created. Temporary password "
+                               f"(shown once — share it securely, the user must change it "
+                               f"at first login):")
+                    st.code(temp_password)
+
+    with col_manage:
+        st.subheader("Manage an existing account")
+        if users_df.empty:
+            st.info("No users yet.")
+        else:
+            target = st.selectbox("Account", users_df["username"].tolist(), key="manage_target")
+            target_row = users_df[users_df["username"] == target].iloc[0]
+
+            new_role_for_target = st.selectbox(
+                "Change role", ALL_ROLES,
+                index=ALL_ROLES.index(target_row["role"]) if target_row["role"] in ALL_ROLES else 0,
+                format_func=lambda r: ROLE_LABELS.get(r, r), key="role_select",
+            )
+            if st.button("Apply role change", key="apply_role"):
+                set_user_role(conn, target, new_role_for_target)
+                log_audit(conn, "USERS", "ROLE_CHANGED", user_name, record_ref=target,
+                          comment=f"new_role={new_role_for_target}")
+                st.success(f"Role updated for {target}.")
+                st.rerun()
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if bool(target_row["active"]):
+                    if st.button("Deactivate account", key="deactivate"):
+                        set_user_active(conn, target, False)
+                        log_audit(conn, "USERS", "USER_DEACTIVATED", user_name, record_ref=target)
+                        st.success(f"{target} deactivated.")
+                        st.rerun()
+                else:
+                    if st.button("Reactivate account", key="reactivate"):
+                        set_user_active(conn, target, True)
+                        log_audit(conn, "USERS", "USER_REACTIVATED", user_name, record_ref=target)
+                        st.success(f"{target} reactivated.")
+                        st.rerun()
+            with col_b:
+                if st.button("Reset password", key="reset_pwd"):
+                    temp_password = generate_temp_password()
+                    admin_reset_password(conn, target, hash_password(temp_password))
+                    log_audit(conn, "USERS", "PASSWORD_RESET_BY_ADMIN", user_name, record_ref=target)
+                    st.success(f"Password reset for {target} (must change at next login):")
+                    st.code(temp_password)
 
 
 def page_settings(conn, user_name):
@@ -665,6 +787,21 @@ def page_settings(conn, user_name):
             log_audit(conn, "SETTINGS", "UPDATE_BRANDING", user_name, comment=f"company_name={new_name}")
             st.success("Settings saved.")
             st.rerun()
+
+    with st.container(border=True):
+        st.subheader("Backup")
+        st.caption("Download a full snapshot of the database file (SQLite). "
+                    "Recommended policy: at least weekly, stored somewhere other than "
+                    "this app's own filesystem (SQLite on Streamlit Cloud has no built-in "
+                    "backup/retention).")
+        try:
+            with open(DB_PATH, "rb") as f:
+                db_bytes = f.read()
+            if st.download_button("⬇️ Download database snapshot (.db)", db_bytes,
+                                    file_name=f"blood_study_backup_{date.today()}.db"):
+                log_audit(conn, "SETTINGS", "DB_BACKUP_DOWNLOADED", user_name)
+        except FileNotFoundError:
+            st.info("Database file not found yet.")
 
 
 def page_automation(conn, user_name):
@@ -787,6 +924,12 @@ def main():
     inject_custom_css()
     conn = get_connection()
 
+    # Si l'URL contient ?reset_token=..., on affiche le formulaire de
+    # réinitialisation et on s'arrête là (rien d'autre ne doit se
+    # rendre tant que ce n'est pas résolu).
+    if handle_password_reset_flow(conn):
+        return
+
     username, role, full_name = sidebar_user_identification(conn)
     if not username or role is None:
         render_landing_page(conn)
@@ -839,6 +982,8 @@ def main():
         page_settings(conn, username)
     elif page == "Automation":
         page_automation(conn, username)
+    elif page == "User Management":
+        page_user_management(conn, username)
     elif page == "Audit Trail":
         page_audit_trail(conn)
 

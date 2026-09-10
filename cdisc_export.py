@@ -1,7 +1,7 @@
 """
 cdisc_export.py — Exports CDISC complémentaires : domaine DM
 (Demographics) et un define.xml de départ.
- 
+
 Important, à indiquer clairement à votre data manager / votre CRO :
 le define.xml généré ici couvre uniquement les domaines LB et DM tels
 qu'implémentés dans cette application, avec une structure Define-XML
@@ -12,24 +12,24 @@ précis par variable) et validé avec un outil de contrôle CDISC
 define.xml certifié.
 """
 from datetime import date
- 
+
 import pandas as pd
- 
+
 from db import read_full_results
 from constants import STUDYID
- 
- 
+
+
 def generate_dm_domain(conn) -> pd.DataFrame:
     """Domaine DM (Demographics) — une ligne par patient."""
     df = read_full_results(conn)
     if df.empty:
         return pd.DataFrame(columns=["STUDYID", "DOMAIN", "USUBJID", "SUBJID", "SITEID",
                                       "AGE", "AGEU", "SEX", "COUNTRY"])
- 
+
     patients = df.drop_duplicates(subset=["usubjid"]).copy()
     current_year = date.today().year
     patients["AGE"] = current_year - patients["birth_year"]
- 
+
     dm = pd.DataFrame({
         "STUDYID": STUDYID,
         "DOMAIN": "DM",
@@ -42,8 +42,8 @@ def generate_dm_domain(conn) -> pd.DataFrame:
         "COUNTRY": patients["country"],
     })
     return dm.reset_index(drop=True)
- 
- 
+
+
 _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!-- Define-XML v2.0 (starter / non certifie) - genere par l'application BLOOD Study LIMS -->
 <ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" xmlns:def="http://www.cdisc.org/ns/def/v2.0"
@@ -56,7 +56,7 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
       <ProtocolName>{studyid}</ProtocolName>
     </GlobalVariables>
     <MetaDataVersion OID="MDV.1" Name="{studyid} SDTM Define (LB, DM)" def:DefineVersion="2.0.0">
- 
+
       <ItemGroupDef OID="IG.LB" Name="LB" Repeating="Yes" Domain="LB" def:Structure="One record per lab test per visit per subject" def:Class="FINDINGS">
         <Description><TranslatedText xml:lang="en">Laboratory Test Results</TranslatedText></Description>
         <ItemRef ItemOID="IT.LB.STUDYID" OrderNumber="1" Mandatory="Yes"/>
@@ -73,7 +73,7 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
         <ItemRef ItemOID="IT.LB.VISIT" OrderNumber="12" Mandatory="No"/>
         <ItemRef ItemOID="IT.LB.LBDTC" OrderNumber="13" Mandatory="No"/>
       </ItemGroupDef>
- 
+
       <ItemGroupDef OID="IG.DM" Name="DM" Repeating="No" Domain="DM" def:Structure="One record per subject" def:Class="SPECIAL PURPOSE">
         <Description><TranslatedText xml:lang="en">Demographics</TranslatedText></Description>
         <ItemRef ItemOID="IT.DM.STUDYID" OrderNumber="1" Mandatory="Yes"/>
@@ -86,7 +86,7 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
         <ItemRef ItemOID="IT.DM.SEX" OrderNumber="8" Mandatory="No"/>
         <ItemRef ItemOID="IT.DM.COUNTRY" OrderNumber="9" Mandatory="No"/>
       </ItemGroupDef>
- 
+
       <!-- ItemDefs simplifies : DataType/Length indicatifs, a affiner avant depot reglementaire -->
       <ItemDef OID="IT.LB.STUDYID" Name="STUDYID" DataType="text" Length="20"/>
       <ItemDef OID="IT.LB.DOMAIN" Name="DOMAIN" DataType="text" Length="2"/>
@@ -101,7 +101,7 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
       <ItemDef OID="IT.LB.VISITNUM" Name="VISITNUM" DataType="integer" Length="8"/>
       <ItemDef OID="IT.LB.VISIT" Name="VISIT" DataType="text" Length="20"/>
       <ItemDef OID="IT.LB.LBDTC" Name="LBDTC" DataType="text" Length="20"/>
- 
+
       <ItemDef OID="IT.DM.STUDYID" Name="STUDYID" DataType="text" Length="20"/>
       <ItemDef OID="IT.DM.DOMAIN" Name="DOMAIN" DataType="text" Length="2"/>
       <ItemDef OID="IT.DM.USUBJID" Name="USUBJID" DataType="text" Length="40"/>
@@ -111,13 +111,13 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
       <ItemDef OID="IT.DM.AGEU" Name="AGEU" DataType="text" Length="10"/>
       <ItemDef OID="IT.DM.SEX" Name="SEX" DataType="text" Length="1"/>
       <ItemDef OID="IT.DM.COUNTRY" Name="COUNTRY" DataType="text" Length="3"/>
- 
+
     </MetaDataVersion>
   </Study>
 </ODM>
 """
- 
- 
+
+
 def generate_define_xml() -> bytes:
     now = pd.Timestamp.utcnow()
     xml = _DEFINE_XML_TEMPLATE.format(
@@ -126,4 +126,3 @@ def generate_define_xml() -> bytes:
         generated_datetime=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     return xml.encode("utf-8")
- 

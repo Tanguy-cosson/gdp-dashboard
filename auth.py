@@ -2,13 +2,16 @@
 auth.py — Authentification, session, sécurité des comptes.
 
 Trois mécanismes de sécurité ajoutés par rapport à la version initiale :
-1. Verrouillage temporaire après plusieurs échecs de connexion.
+1. Verrouillage temporaire après plusieurs échecs de connexion
+   (protection brute-force absente auparavant).
 2. Changement de mot de passe FORCÉ après une réinitialisation par un
-   administrateur CRO.
+   administrateur CRO (l'utilisateur ne peut pas continuer à utiliser
+   le mot de passe temporaire indéfiniment).
 3. "Mot de passe oublié" en self-service : jeton à usage unique envoyé
    par e-mail (via automation.send_email), valable 60 minutes.
 
-Toujours pas de repli en clair sur le mot de passe.
+Toujours pas de repli en clair sur le mot de passe : si bcrypt échoue,
+c'est un refus, point final.
 """
 import secrets
 import string
@@ -284,8 +287,8 @@ def sidebar_user_identification(conn):
                 return None, None, None
 
             if _is_locked(record):
-                st.sidebar.error("Account temporarily locked after repeated failed attempts. "
-                                  "Try again in a few minutes.")
+                st.sidebar.error(f"Account temporarily locked after repeated failed attempts. "
+                                  f"Try again in a few minutes.")
                 log_audit(conn, "USERS", "LOGIN_BLOCKED_LOCKED", username_input)
                 return None, None, None
 

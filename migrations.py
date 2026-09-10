@@ -14,6 +14,11 @@ stocké dans SETTINGS. Un compteur seul peut mentir (ex: une valeur par
 défaut insérée par erreur ferait croire qu'une base ancienne est déjà
 à jour). schema_version n'est donc mis à jour qu'APRÈS coup, comme
 trace/audit — jamais comme condition d'exécution.
+
+C'est l'inverse volontaire de l'ancien pattern
+'ALTER TABLE ... ; except: pass' exécuté à chaque page : ici c'est
+tracé, appliqué au plus une fois par base (grâce à l'introspection),
+et audité.
 """
 from audit import log_audit
 from db import set_setting
