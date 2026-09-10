@@ -7,13 +7,13 @@
 -- code). Toute évolution future de schéma = une nouvelle section
 -- numérotée ci-dessous, jamais un ALTER TABLE caché dans app.py.
 -- =====================================================================
-
+ 
 CREATE TABLE IF NOT EXISTS SITES (
     site_id     TEXT PRIMARY KEY,
     site_name   TEXT NOT NULL,
     country     TEXT NOT NULL
 );
-
+ 
 CREATE TABLE IF NOT EXISTS PATIENTS (
     patient_id  TEXT PRIMARY KEY,
     usubjid     TEXT NOT NULL UNIQUE,
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS PATIENTS (
     birth_year  INTEGER,
     FOREIGN KEY (site_id) REFERENCES SITES(site_id)
 );
-
+ 
 CREATE TABLE IF NOT EXISTS VISITES (
     visit_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     patient_id  TEXT NOT NULL,
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS VISITES (
     FOREIGN KEY (patient_id) REFERENCES PATIENTS(patient_id),
     UNIQUE (patient_id, visit_code)
 );
-
+ 
 -- ---------------------------------------------------------------------
 -- SAMPLES : chaîne de conservation (chain of custody).
 -- barcode_value : identifiant encodé en Code128 sur l'étiquette physique
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS SAMPLES (
     FOREIGN KEY (visit_id) REFERENCES VISITES(visit_id),
     UNIQUE (patient_id, visit_id, sample_type)
 );
-
+ 
 -- ---------------------------------------------------------------------
 -- Emplacement physique de stockage (congélateur / rack / boîte / puits).
 -- Séparée de SAMPLES car un échantillon peut être déplacé plusieurs
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS STORAGE_LOCATIONS (
     moved_by               TEXT,
     FOREIGN KEY (sample_id) REFERENCES SAMPLES(sample_id)
 );
-
+ 
 -- ---------------------------------------------------------------------
 -- LAB_RESULTS : workflow de validation à 2 niveaux.
 --   PENDING       -> à la charge du technicien de laboratoire
@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS LAB_RESULTS (
     FOREIGN KEY (visit_id) REFERENCES VISITES(visit_id),
     FOREIGN KEY (sample_id) REFERENCES SAMPLES(sample_id)
 );
-
+ 
 -- ---------------------------------------------------------------------
 -- AUDIT_TRAIL : une seule forme d'écriture possible, via log_audit()
 -- dans audit.py. Ne JAMAIS insérer directement dans cette table
@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS AUDIT_TRAIL (
     record_ref              TEXT,   -- ex : result_id, sample_id concernés
     comment                   TEXT
 );
-
+ 
 -- Immutabilité de la piste d'audit (21 CFR Part 11 / Annexe 11 §9) :
 -- interdiction, au niveau base, de supprimer ou modifier une ligne.
 CREATE TRIGGER IF NOT EXISTS trg_audit_no_delete
@@ -139,25 +139,44 @@ BEFORE DELETE ON AUDIT_TRAIL
 BEGIN
     SELECT RAISE(ABORT, 'AUDIT_TRAIL is append-only: deletion is not permitted.');
 END;
-
+ 
 CREATE TRIGGER IF NOT EXISTS trg_audit_no_update
 BEFORE UPDATE ON AUDIT_TRAIL
 BEGIN
     SELECT RAISE(ABORT, 'AUDIT_TRAIL is append-only: modification is not permitted.');
 END;
-
+ 
 -- ---------------------------------------------------------------------
 -- RBAC : 5 rôles métier.
 -- ---------------------------------------------------------------------
+-- active / failed_login_count / locked_until / must_change_password :
+-- gestion des comptes (verrouillage anti brute-force, changement de mot
+-- de passe forcé après réinitialisation par un administrateur CRO).
 CREATE TABLE IF NOT EXISTS USERS (
-    username        TEXT PRIMARY KEY,
-    full_name        TEXT NOT NULL,
-    role              TEXT NOT NULL CHECK (role IN
-                      ('LAB_TECH', 'BIOLOGIST', 'PHYSICIAN', 'CRO', 'SPONSOR')),
-    password_hash      TEXT NOT NULL,
-    email                TEXT
+    username                TEXT PRIMARY KEY,
+    full_name                TEXT NOT NULL,
+    role                      TEXT NOT NULL CHECK (role IN
+                              ('LAB_TECH', 'BIOLOGIST', 'PHYSICIAN', 'CRO', 'SPONSOR')),
+    password_hash              TEXT NOT NULL,
+    email                        TEXT,
+    active                        INTEGER NOT NULL DEFAULT 1,
+    failed_login_count             INTEGER NOT NULL DEFAULT 0,
+    locked_until                     TEXT,
+    must_change_password               INTEGER NOT NULL DEFAULT 0,
+    created_at                           TEXT DEFAULT (datetime('now'))
 );
-
+ 
+-- Jetons de réinitialisation de mot de passe à usage unique (flux
+-- "mot de passe oublié" en self-service, sans intervention CRO).
+CREATE TABLE IF NOT EXISTS PASSWORD_RESET_TOKENS (
+    token           TEXT PRIMARY KEY,
+    username         TEXT NOT NULL,
+    created_at         TEXT DEFAULT (datetime('now')),
+    expires_at           TEXT NOT NULL,
+    used_at                TEXT,
+    FOREIGN KEY (username) REFERENCES USERS(username)
+);
+ 
 CREATE TABLE IF NOT EXISTS REMARKS (
     remark_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     result_id        INTEGER NOT NULL,
@@ -166,12 +185,12 @@ CREATE TABLE IF NOT EXISTS REMARKS (
     created_at            TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (result_id) REFERENCES LAB_RESULTS(result_id)
 );
-
+ 
 CREATE TABLE IF NOT EXISTS SETTINGS (
     setting_key     TEXT PRIMARY KEY,
     setting_value    TEXT
 );
-
+ 
 -- Comptes de démonstration — mots de passe en clair UNIQUEMENT pour cet
 -- exercice pédagogique (à retirer / régénérer avant toute mise en
 -- production réelle avec des données patients).
@@ -191,7 +210,7 @@ INSERT OR IGNORE INTO USERS (username, full_name, role, password_hash, email) VA
      '$2b$12$KtPxzSk4lhKesScoqnvbL.6pgYPvcqMBXMR26M7cMlJsH.602HSYS', 'cro_arc@example.com'),
     ('sponsor_lph','Promoteur LPH',                  'SPONSOR',
      '$2b$12$obXTbTSMD8C6V8fIhZOcauTb8T6iBRsd1ZfRlMcntlygOpZnykU/u', 'sponsor_lph@example.com');
-
+ 
 INSERT OR IGNORE INTO SETTINGS (setting_key, setting_value) VALUES
     ('company_name', 'Clinical Services'),
     ('logo_base64', ''),
@@ -204,7 +223,13 @@ INSERT OR IGNORE INTO SETTINGS (setting_key, setting_value) VALUES
     ('notify_emails_lab', ''),      -- liste séparée par des virgules
     ('notify_emails_sponsor', ''),
     ('notify_emails_critical', '');
-
+-- Remarque : PAS de 'schema_version' ici volontairement. Le numéro de
+-- version dans SETTINGS n'est mis à jour QUE par migrations.py, une
+-- fois qu'il a réellement vérifié/appliqué chaque migration — jamais
+-- par une valeur par défaut insérée ici, qui donnerait un faux
+-- sentiment de "déjà à jour" à une base ancienne qui ne l'est pas
+-- (voir l'en-tête de migrations.py pour le pourquoi).
+ 
 -- ---------------------------------------------------------------------
 -- Vue principale : jointure complète résultats + échantillon + patient
 -- + site. Champs échantillon nullable pour compatibilité ascendante.

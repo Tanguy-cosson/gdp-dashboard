@@ -15,9 +15,24 @@ PAGE_PERMISSIONS = {
     "CRO": ["Dashboard", "Patient Search", "Patient follow-up", "Sample Labels",
             "Sample Scan", "Technical Validation", "Biological Validation",
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
-            "Settings", "Audit Trail", "Automation"],
+            "Settings", "Automation", "User Management", "Audit Trail"],
     "SPONSOR": ["VINC extraction", "Notes"],
 }
+
+# ---------------------------------------------------------------------
+# Sécurité des comptes
+# ---------------------------------------------------------------------
+LOGIN_LOCKOUT_THRESHOLD = 5          # tentatives échouées avant verrouillage
+LOGIN_LOCKOUT_MINUTES = 15           # durée du verrouillage
+PASSWORD_RESET_TOKEN_MINUTES = 60    # durée de validité d'un lien de réinitialisation
+
+ALL_ROLES = ["LAB_TECH", "BIOLOGIST", "PHYSICIAN", "CRO", "SPONSOR"]
+
+ESIGNATURE_LEGAL_NOTICE = (
+    "By entering your password to sign, you are applying your unique electronic "
+    "signature to this record. Under 21 CFR Part 11 §11.100, this signature is "
+    "legally binding and equivalent to a handwritten signature on paper."
+)
 
 OOR_FLAG = "⚠️ Outlier"
 NORMAL_FLAG = "✅ Normal"

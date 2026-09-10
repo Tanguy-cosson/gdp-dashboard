@@ -9,7 +9,7 @@ là-bas (voir l'en-tête du fichier).
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +25,13 @@ def get_connection():
     with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
         conn.executescript(f.read())
     conn.commit()
+
+    # Rattrape le schéma des bases créées par une version antérieure de
+    # schema.sql (voir migrations.py). Import différé pour éviter un
+    # cycle (migrations.py importe get_setting/set_setting d'ici).
+    from migrations import run_migrations
+    run_migrations(conn)
+
     return conn
 
 
@@ -274,3 +281,128 @@ def read_audit_trail(conn):
 def count_by_status(conn, status):
     cur = conn.execute("SELECT COUNT(*) FROM LAB_RESULTS WHERE status = ?", (status,))
     return cur.fetchone()[0]
+
+
+# ---------------------------------------------------------------------
+# USERS — administration (création, désactivation, verrouillage)
+# ---------------------------------------------------------------------
+def list_users(conn):
+    return pd.read_sql_query(
+        "SELECT username, full_name, role, email, active, failed_login_count, "
+        "locked_until, must_change_password, created_at FROM USERS ORDER BY created_at DESC",
+        conn,
+    )
+
+
+def username_exists(conn, username):
+    cur = conn.execute("SELECT 1 FROM USERS WHERE username = ?", (username,))
+    return cur.fetchone() is not None
+
+
+def create_user(conn, username, full_name, role, email, password_hash):
+    conn.execute(
+        "INSERT INTO USERS (username, full_name, role, password_hash, email, "
+        "active, must_change_password, created_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?)",
+        (username, full_name, role, password_hash, email, now_utc_iso()),
+    )
+    conn.commit()
+
+
+def set_user_active(conn, username, active: bool):
+    conn.execute("UPDATE USERS SET active = ? WHERE username = ?", (1 if active else 0, username))
+    conn.commit()
+
+
+def set_user_role(conn, username, role):
+    conn.execute("UPDATE USERS SET role = ? WHERE username = ?", (role, username))
+    conn.commit()
+
+
+def admin_reset_password(conn, username, password_hash):
+    """Réinitialisation par un administrateur (CRO) : force un
+    changement de mot de passe à la prochaine connexion."""
+    conn.execute(
+        "UPDATE USERS SET password_hash = ?, must_change_password = 1, "
+        "failed_login_count = 0, locked_until = NULL WHERE username = ?",
+        (password_hash, username),
+    )
+    conn.commit()
+
+
+def clear_must_change_password(conn, username):
+    conn.execute("UPDATE USERS SET must_change_password = 0 WHERE username = ?", (username,))
+    conn.commit()
+
+
+def record_login_failure(conn, username, lockout_threshold, lockout_minutes):
+    """Incrémente le compteur d'échecs ; verrouille le compte si le
+    seuil est atteint. Renvoie True si le compte vient d'être verrouillé."""
+    cur = conn.execute("SELECT failed_login_count FROM USERS WHERE username = ?", (username,))
+    row = cur.fetchone()
+    if row is None:
+        return False
+    new_count = (row[0] or 0) + 1
+    just_locked = new_count >= lockout_threshold
+    if just_locked:
+        locked_until = (datetime.now(timezone.utc) + timedelta(
+            minutes=lockout_minutes)).isoformat(timespec="seconds")
+        conn.execute("UPDATE USERS SET failed_login_count = ?, locked_until = ? WHERE username = ?",
+                      (new_count, locked_until, username))
+    else:
+        conn.execute("UPDATE USERS SET failed_login_count = ? WHERE username = ?",
+                      (new_count, username))
+    conn.commit()
+    return just_locked
+
+
+def record_login_success(conn, username):
+    conn.execute(
+        "UPDATE USERS SET failed_login_count = 0, locked_until = NULL WHERE username = ?",
+        (username,),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Réinitialisation de mot de passe en self-service (jeton par e-mail)
+# ---------------------------------------------------------------------
+def create_password_reset_token(conn, username, token, expires_minutes):
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO PASSWORD_RESET_TOKENS (token, username, expires_at) VALUES (?, ?, ?)",
+        (token, username, expires_at),
+    )
+    conn.commit()
+
+
+def consume_password_reset_token(conn, token):
+    """Valide un jeton (non expiré, non déjà utilisé), le marque comme
+    utilisé, et renvoie le username associé — ou None si invalide."""
+    cur = conn.execute(
+        "SELECT username, expires_at, used_at FROM PASSWORD_RESET_TOKENS WHERE token = ?",
+        (token,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    username, expires_at, used_at = row
+    if used_at is not None:
+        return None
+    expires_dt = datetime.fromisoformat(expires_at)
+    if expires_dt.tzinfo is None:
+        expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > expires_dt:
+        return None
+    conn.execute("UPDATE PASSWORD_RESET_TOKENS SET used_at = ? WHERE token = ?",
+                  (now_utc_iso(), token))
+    conn.commit()
+    return username
+
+
+def find_user_by_username_or_email(conn, identifier):
+    cur = conn.execute(
+        "SELECT username FROM USERS WHERE username = ? OR email = ?",
+        (identifier, identifier),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
