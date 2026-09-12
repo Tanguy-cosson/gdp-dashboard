@@ -65,11 +65,35 @@ def _migration_1_user_management(conn):
     conn.commit()
 
 
+def _migration_2_gdpr_and_hl7(conn):
+    """Ajoute les champs de pseudonymisation RGPD sur PATIENTS et la
+    table CONSENT."""
+    if not _column_exists(conn, "PATIENTS", "anonymized"):
+        conn.execute("ALTER TABLE PATIENTS ADD COLUMN anonymized INTEGER NOT NULL DEFAULT 0")
+    if not _column_exists(conn, "PATIENTS", "anonymized_at"):
+        conn.execute("ALTER TABLE PATIENTS ADD COLUMN anonymized_at TEXT")
+    if not _table_exists(conn, "CONSENT"):
+        conn.execute("""
+            CREATE TABLE CONSENT (
+                consent_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id       TEXT NOT NULL,
+                usubjid           TEXT NOT NULL,
+                status             TEXT NOT NULL,
+                document_ref         TEXT,
+                recorded_by            TEXT NOT NULL,
+                recorded_at              TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (patient_id) REFERENCES PATIENTS(patient_id)
+            )
+        """)
+    conn.commit()
+
+
 # (version, nom, fonction). Toujours ajouter en fin de liste, ne
 # jamais modifier une migration déjà publiée — en écrire une nouvelle
 # à la place si un correctif est nécessaire.
 MIGRATIONS = [
     (1, "user_management_and_password_reset", _migration_1_user_management),
+    (2, "gdpr_and_hl7", _migration_2_gdpr_and_hl7),
 ]
 
 
@@ -78,8 +102,12 @@ def run_migrations(conn):
     rejouer une migration déjà appliquée ne fait rien, grâce à
     l'introspection). schema_version est mis à jour après coup, à titre
     de trace uniquement — il ne conditionne jamais l'exécution."""
+    checks = {
+        1: lambda: not _column_exists(conn, "USERS", "active"),
+        2: lambda: not _column_exists(conn, "PATIENTS", "anonymized"),
+    }
     for version, name, migration_fn in MIGRATIONS:
-        was_missing = not _column_exists(conn, "USERS", "active") if version == 1 else None
+        was_missing = checks.get(version, lambda: True)()
 
         migration_fn(conn)
 

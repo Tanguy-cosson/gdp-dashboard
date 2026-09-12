@@ -78,8 +78,12 @@ def generate_vinc_pdf_report(conn, vinc_df, generated_by):
     return bytes(pdf.output(dest="S"))
 
 
-def generate_patient_pdf_report(conn, usubjid, generated_by):
-    """Compte-rendu biologique complet pour un patient."""
+def generate_patient_pdf_report(conn, usubjid, generated_by, password=None):
+    """Compte-rendu biologique complet pour un patient. Si `password`
+    est fourni, le PDF est chiffré (mot de passe utilisateur = lecture,
+    mot de passe propriétaire distinct = permissions) — utilisé pour la
+    diffusion automatique sécurisée par e-mail (voir automation.py /
+    streamlit_app.py, page Biological Validation)."""
     df = read_full_results(conn)
     patient_df = df[df["usubjid"] == usubjid].copy()
     if patient_df.empty:
@@ -172,4 +176,8 @@ def generate_patient_pdf_report(conn, usubjid, generated_by):
         f"{validator}. This generation is itself recorded in the immutable audit trail "
         f"(21 CFR Part 11 / Annex 11)."
     )
+
+    if password:
+        pdf.set_encryption(owner_password=password + "-owner", user_password=password)
+
     return bytes(pdf.output(dest="S"))

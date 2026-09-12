@@ -9,13 +9,13 @@ ROLE_LABELS = {
 }
 
 PAGE_PERMISSIONS = {
-    "LAB_TECH": ["Data Ingestion", "Sample Labels", "Sample Scan", "Technical Validation"],
-    "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes"],
+    "LAB_TECH": ["Data Ingestion", "HL7 Import", "Sample Labels", "Sample Scan", "Technical Validation", "Process Flow"],
+    "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes", "Process Flow"],
     "PHYSICIAN": ["Patient Records", "Notes"],
-    "CRO": ["Dashboard", "Patient Search", "Patient follow-up", "Sample Labels",
+    "CRO": ["Dashboard", "Process Flow", "Patient Search", "Patient follow-up", "Sample Labels",
             "Sample Scan", "Technical Validation", "Biological Validation",
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
-            "Settings", "Automation", "User Management", "Audit Trail"],
+            "Data Privacy", "Settings", "Automation", "User Management", "Audit Trail"],
     "SPONSOR": ["VINC extraction", "Notes"],
 }
 

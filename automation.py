@@ -19,6 +19,8 @@ planter l'application pour les utilisateurs métier.
 """
 import smtplib
 from datetime import date, datetime, timezone
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import streamlit as st
@@ -46,6 +48,49 @@ def send_email(subject, body, recipients):
     de réinitialisation de mot de passe) — même logique que les
     relances automatiques, même tolérance aux erreurs."""
     return _send_email(subject, body, recipients)
+
+
+def send_secure_report(subject, body, recipients, attachment_bytes, attachment_filename):
+    """Envoie un e-mail avec le compte rendu PDF (chiffré par mot de
+    passe, voir pdf_reports.generate_patient_pdf_report) en pièce
+    jointe.
+
+    ====================== POINT D'INTÉGRATION MSSANTÉ =====================
+    Cette fonction envoie aujourd'hui via SMTP classique (chiffré au
+    niveau du PDF lui-même, pas au niveau du transport). Ce n'est PAS
+    une messagerie de santé sécurisée MSSanté : MSSanté nécessite une
+    accréditation ANS et passe par un opérateur agréé (ex: Apicrypt,
+    Mailiz, therapass) avec sa propre API ou passerelle SMTP dédiée.
+
+    Le jour où vous avez un compte MSSanté opérateur, remplacez le
+    corps de cette fonction par un appel à l'API de cet opérateur —
+    la signature de la fonction (mêmes paramètres : sujet, corps,
+    destinataires, pièce jointe) ne devrait pas avoir besoin de
+    changer, donc aucun autre fichier du projet n'aura à être modifié.
+    ==========================================================================
+    """
+    recipients = [r.strip() for r in recipients if r.strip()]
+    if not recipients or not _smtp_configured():
+        return False
+    try:
+        cfg = st.secrets["smtp"]
+        msg = MIMEMultipart()
+        msg["Subject"] = subject
+        msg["From"] = cfg["sender"]
+        msg["To"] = ", ".join(recipients)
+        msg.attach(MIMEText(body))
+
+        part = MIMEApplication(attachment_bytes, Name=attachment_filename)
+        part["Content-Disposition"] = f'attachment; filename="{attachment_filename}"'
+        msg.attach(part)
+
+        with smtplib.SMTP(cfg["host"], int(cfg.get("port", 587)), timeout=15) as server:
+            server.starttls()
+            server.login(cfg["username"], cfg["password"])
+            server.sendmail(cfg["sender"], recipients, msg.as_string())
+        return True
+    except Exception:
+        return False
 
 
 def _send_email(subject, body, recipients):

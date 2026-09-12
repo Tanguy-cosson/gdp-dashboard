@@ -406,3 +406,23 @@ def find_user_by_username_or_email(conn, identifier):
     )
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def get_usubjids_for_results(conn, result_ids):
+    """Renvoie la liste (dédupliquée) des usubjid concernés par un lot
+    de result_id — utilisé pour savoir à quels patients envoyer un
+    compte rendu après une signature biologique groupée."""
+    if not result_ids:
+        return []
+    placeholders = ",".join("?" for _ in result_ids)
+    cur = conn.execute(
+        f"""
+        SELECT DISTINCT p.usubjid
+        FROM LAB_RESULTS lr
+        JOIN VISITES v ON lr.visit_id = v.visit_id
+        JOIN PATIENTS p ON v.patient_id = p.patient_id
+        WHERE lr.result_id IN ({placeholders})
+        """,
+        result_ids,
+    )
+    return [row[0] for row in cur.fetchall()]

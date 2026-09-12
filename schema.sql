@@ -21,7 +21,21 @@ CREATE TABLE IF NOT EXISTS PATIENTS (
     subjid      TEXT NOT NULL,
     sex         TEXT CHECK (sex IN ('M', 'F')),
     birth_year  INTEGER,
+    anonymized     INTEGER NOT NULL DEFAULT 0,
+    anonymized_at     TEXT,
     FOREIGN KEY (site_id) REFERENCES SITES(site_id)
+);
+
+-- Journal de consentement RGPD (voir gdpr.py).
+CREATE TABLE IF NOT EXISTS CONSENT (
+    consent_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id       TEXT NOT NULL,
+    usubjid           TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    document_ref         TEXT,
+    recorded_by            TEXT NOT NULL,
+    recorded_at              TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (patient_id) REFERENCES PATIENTS(patient_id)
 );
 
 CREATE TABLE IF NOT EXISTS VISITES (
@@ -222,7 +236,9 @@ INSERT OR IGNORE INTO SETTINGS (setting_key, setting_value) VALUES
     ('last_reminder_critical_sent', ''),
     ('notify_emails_lab', ''),      -- liste séparée par des virgules
     ('notify_emails_sponsor', ''),
-    ('notify_emails_critical', '');
+    ('notify_emails_critical', ''),
+    ('notify_emails_physician', ''),      -- destinataires des comptes rendus auto-envoyés
+    ('auto_send_reports_enabled', '0');   -- désactivé par défaut : à activer volontairement (Settings)
 -- Remarque : PAS de 'schema_version' ici volontairement. Le numéro de
 -- version dans SETTINGS n'est mis à jour QUE par migrations.py, une
 -- fois qu'il a réellement vérifié/appliqué chaque migration — jamais

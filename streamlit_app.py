@@ -8,7 +8,7 @@ import streamlit as st
 from audit import log_audit
 from auth import (generate_temp_password, handle_password_reset_flow, hash_password,
                    sidebar_user_identification, validate_password_complexity)
-from automation import check_and_send_reminders
+from automation import check_and_send_reminders, send_secure_report
 from barcode_utils import (decode_barcode_from_image, generate_barcode_png,
                             generate_sample_label_pdf, zbar_available)
 from business_logic import (build_patients_matrix, compute_oor_flag, compute_tat_hours,
@@ -20,12 +20,15 @@ from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_st
                 create_user, find_sample_by_barcode, get_connection,
                 get_current_storage_location, get_or_create_patient, get_or_create_sample,
                 get_or_create_site, get_or_create_visit, get_samples_pending_labels,
-                get_setting, insert_lab_result, insert_remark, list_users,
-                mark_biological_validation, mark_labels_printed, mark_technical_validation,
-                read_audit_trail, read_full_results, read_remarks, set_setting,
-                set_user_active, set_user_role, username_exists)
+                get_setting, get_usubjids_for_results, insert_lab_result, insert_remark,
+                list_users, mark_biological_validation, mark_labels_printed,
+                mark_technical_validation, read_audit_trail, read_full_results,
+                read_remarks, set_setting, set_user_active, set_user_role, username_exists)
+from gdpr import anonymize_patient, export_patient_data, get_all_consent, record_consent
+from hl7_import import parse_oru_r01, parse_ref_range
 from pdf_reports import generate_patient_pdf_report, generate_vinc_pdf_report
 from ui import _html, inject_custom_css, kpi_card, render_landing_page, render_top_banner
+from workflow_viz import render_pipeline_svg, render_status_stepper
 
 st.set_page_config(page_title="Projet BLOOD", page_icon="🩸", layout="wide")
 
@@ -394,12 +397,88 @@ def page_biological_validation(conn, user_name):
                               record_ref=str(selected_ids),
                               comment=f"{n} résultats signés. Reason={reason}. Remarks={remarks}")
                     st.success(f"✅ {n} résultat(s) validé(s) et signé(s) biologiquement avec succès !")
+
+                    _maybe_auto_send_reports(conn, selected_ids, user_name)
                     st.rerun()
+
+
+def _maybe_auto_send_reports(conn, result_ids, user_name):
+    """Si activé dans Settings/Automation, génère et envoie automatiquement
+    (PDF chiffré par mot de passe) le compte rendu des patients concernés
+    par cette signature biologique. Échoue silencieusement (log en audit
+    trail) si le SMTP ou le mot de passe ne sont pas configurés — ne doit
+    jamais bloquer la validation elle-même, qui est déjà actée en base."""
+    if get_setting(conn, "auto_send_reports_enabled", "0") != "1":
+        return
+    recipients = (get_setting(conn, "notify_emails_physician", "") or "").split(",")
+    report_password = get_setting(conn, "report_pdf_password")
+    if not recipients or not any(r.strip() for r in recipients) or not report_password:
+        return
+
+    usubjids = get_usubjids_for_results(conn, result_ids)
+    for usubjid in usubjids:
+        pdf_bytes = generate_patient_pdf_report(conn, usubjid, user_name, password=report_password)
+        if pdf_bytes is None:
+            continue
+        sent = send_secure_report(
+            subject=f"[BLOOD Study] Compte rendu biologique — {usubjid}",
+            body=(f"Le compte rendu biologique de {usubjid} vient d'être validé et signé. "
+                  f"Le PDF ci-joint est protégé par mot de passe (communiqué séparément)."),
+            recipients=recipients,
+            attachment_bytes=pdf_bytes,
+            attachment_filename=f"{usubjid}_report_{date.today()}.pdf",
+        )
+        log_audit(conn, "LAB_RESULTS", "REPORT_AUTO_SENT" if sent else "REPORT_AUTO_SEND_FAILED",
+                  user_name, record_ref=usubjid)
 
 
 # =====================================================================
 # PAGES — CRO / DASHBOARD
 # =====================================================================
+def page_process_flow(conn):
+    """Vue visuelle du pipeline : le schéma d'ensemble avec les
+    compteurs en direct, puis un tableau façon Kanban listant les
+    échantillons à chaque étape — pour voir d'un coup d'œil où en est
+    l'étude sans lire une ligne de log."""
+    st.title("PROCESS FLOW")
+    render_critical_alert_banner(conn)
+
+    st.caption("Schéma vivant du pipeline : les compteurs reflètent l'état actuel de la base.")
+    svg = render_pipeline_svg(conn)
+    st.markdown(f'<div style="max-width:760px;margin:0 auto;">{svg}</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("Échantillons par étape")
+    df = read_full_results(conn)
+    if df.empty:
+        st.info("Aucune donnée disponible.")
+        return
+
+    col_pending, col_tech, col_reviewed = st.columns(3)
+    stage_cols = {
+        "PENDING": (col_pending, "⏳ En attente technicien"),
+        "TECHNICAL_OK": (col_tech, "🔬 En attente biologiste"),
+        "REVIEWED": (col_reviewed, "✅ Validés"),
+    }
+    for status, (col, title) in stage_cols.items():
+        with col:
+            st.markdown(f"**{title}**")
+            stage_df = df[df["status"] == status]
+            if stage_df.empty:
+                st.caption("Rien ici.")
+            else:
+                summary = stage_df.groupby("usubjid").size().reset_index(name="n_resultats")
+                for _, row in summary.head(15).iterrows():
+                    st.markdown(_html(f"""
+                    <div class="search-result-card" style="padding:0.5rem 0.8rem; margin-bottom:0.5rem;">
+                        <strong>{row['usubjid']}</strong><br/>
+                        <span style="font-size:0.8rem;color:#7B8794;">{row['n_resultats']} résultat(s)</span>
+                    </div>
+                    """), unsafe_allow_html=True)
+                if len(summary) > 15:
+                    st.caption(f"... et {len(summary) - 15} de plus.")
+
+
 def page_dashboard(conn):
     st.title("DASHBOARD")
     render_critical_alert_banner(conn)
@@ -583,6 +662,15 @@ def page_patient_records(conn, user_name, role):
             log_audit(conn, "LAB_RESULTS", "EXPORT_PDF_PATIENT", user_name, record_ref=selected)
 
     st.subheader("Results")
+    st.caption("Où en est chaque visite dans le workflow de validation :")
+    for visit_code_iter in patient_df["visit_code"].unique():
+        visit_status_series = patient_df[patient_df["visit_code"] == visit_code_iter]["status"]
+        # Le statut le "moins avancé" de la visite prime : une visite n'est
+        # affichée comme validée que si TOUS ses résultats le sont.
+        order = {"PENDING": 0, "TECHNICAL_OK": 1, "REVIEWED": 2}
+        least_advanced = min(visit_status_series, key=lambda s: order.get(s, 0))
+        st.markdown(f"**{visit_code_iter}**")
+        st.markdown(render_status_stepper(least_advanced), unsafe_allow_html=True)
     st.dataframe(patient_df, use_container_width=True)
 
     st.subheader("Biomarker trend across visits")
@@ -620,6 +708,151 @@ def page_patient_records(conn, user_name, role):
         st.info("No notes recorded for this patient.")
     else:
         st.dataframe(patient_remarks, use_container_width=True)
+
+
+def page_hl7_import(conn, user_name):
+    """Import de résultats via message HL7 v2 (ORU^R01) — voir
+    hl7_import.py pour ce que ce parseur fait et ne fait pas
+    (notamment : pas d'écoute réseau temps réel MLLP/RS-232)."""
+    st.title("HL7 IMPORT")
+    st.caption("Importe un message HL7 v2.x (segment ORU^R01) exporté depuis un automate ou "
+                "un LIS existant. La correspondance avec vos visites d'essai (VINC/V1/V2) est "
+                "choisie ci-dessous, car HL7 ne connaît pas votre plan de visites.")
+
+    uploaded_file = st.file_uploader("Fichier HL7 (.hl7 ou .txt)", type=["hl7", "txt"])
+    if uploaded_file is None:
+        return
+
+    raw_text = uploaded_file.getvalue().decode("utf-8", errors="replace")
+    parsed = parse_oru_r01(raw_text)
+
+    if parsed.warnings:
+        with st.expander(f"⚠️ {len(parsed.warnings)} avertissement(s) de lecture", expanded=True):
+            for w in parsed.warnings:
+                st.write(f"- {w}")
+
+    if not parsed.patient_identifier or not parsed.observations:
+        st.error("Message illisible ou incomplet — impossible de continuer l'import.")
+        return
+
+    st.success(f"Patient détecté : {parsed.patient_identifier} "
+               f"(sexe {parsed.patient_sex or '?'}, naissance {parsed.patient_birth_year or '?'})")
+    st.subheader(f"{len(parsed.observations)} résultat(s) détecté(s)")
+    preview_rows = []
+    for obs in parsed.observations:
+        low, high = parse_ref_range(obs.ref_range)
+        preview_rows.append({
+            "test_code": obs.test_code, "test_name": obs.test_name, "value": obs.value,
+            "unit": obs.unit, "ref_low": low, "ref_high": high, "abnormal_flag": obs.abnormal_flag,
+        })
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+
+    st.subheader("Rattachement à l'essai")
+    with st.form("hl7_mapping_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            site_id = st.text_input("Site ID", placeholder="ex: FR-001")
+        with col2:
+            visit_code = st.selectbox("Visite", ["VINC", "V1", "V2"])
+        with col3:
+            visit_num = st.number_input("N° de visite", min_value=1, value=1, step=1)
+        visit_date = st.date_input("Date de visite")
+        sample_type = st.selectbox("Type d'échantillon", ["SERUM", "WHOLE_BLOOD", "PLASMA"])
+        submitted = st.form_submit_button("Importer ces résultats")
+
+        if submitted:
+            if not site_id:
+                st.error("Le site ID est obligatoire.")
+            else:
+                usubjid = f"BLOOD-{site_id}-{parsed.patient_identifier}"
+                get_or_create_site(conn, site_id)
+                get_or_create_patient(conn, parsed.patient_identifier, usubjid, site_id,
+                                       parsed.patient_identifier, parsed.patient_sex or "M",
+                                       parsed.patient_birth_year or 1970)
+                visit_id = get_or_create_visit(conn, parsed.patient_identifier, visit_code,
+                                                str(visit_date), int(visit_num))
+                sample_id = get_or_create_sample(conn, parsed.patient_identifier, visit_id, sample_type)
+
+                for obs in parsed.observations:
+                    low, high = parse_ref_range(obs.ref_range)
+                    try:
+                        value = float(obs.value)
+                    except ValueError:
+                        st.warning(f"Valeur non numérique ignorée pour {obs.test_code} : '{obs.value}'")
+                        continue
+                    insert_lab_result(conn, visit_id, obs.test_code, obs.test_name, value,
+                                       obs.unit, str(visit_date), low, high, sample_id)
+
+                log_audit(conn, "LAB_RESULTS", "INGESTION_HL7", user_name,
+                          record_ref=usubjid, comment=f"{len(parsed.observations)} résultats")
+                st.success(f"{len(parsed.observations)} résultat(s) importé(s) pour {usubjid}, "
+                           "statut PENDING (à valider techniquement).")
+                st.rerun()
+
+
+def page_data_privacy(conn, user_name):
+    """Droits RGPD (export, pseudonymisation) et journal de consentement.
+    Voir gdpr.py — cette page rapproche l'appli de la conformité RGPD
+    mais ne remplace pas un hébergement certifié HDS pour de vraies
+    données patients (voir README)."""
+    st.title("DATA PRIVACY (RGPD)")
+
+    tab_export, tab_anon, tab_consent = st.tabs(
+        ["Droit d'accès (export)", "Pseudonymisation", "Journal de consentement"])
+
+    with tab_export:
+        st.caption("Génère un export complet des données détenues sur un patient (art. 15 RGPD).")
+        df = read_full_results(conn)
+        if df.empty:
+            st.info("Aucune donnée disponible.")
+        else:
+            selected = st.selectbox("Patient", sorted(df["usubjid"].unique().tolist()), key="export_patient")
+            if st.button("Générer l'export JSON"):
+                import json
+                data = export_patient_data(conn, selected)
+                json_bytes = json.dumps(data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+                log_audit(conn, "PATIENTS", "GDPR_EXPORT", user_name, record_ref=selected)
+                st.download_button("⬇️ Télécharger l'export", json_bytes,
+                                    file_name=f"{selected}_gdpr_export_{date.today()}.json",
+                                    mime="application/json")
+
+    with tab_anon:
+        st.caption("Pseudonymise un patient : généralise l'année de naissance par tranche de "
+                    "5 ans et retire l'identifiant local. Les données cliniques (résultats, "
+                    "validations) sont conservées — obligation légale de conservation des "
+                    "données d'essai clinique. Action irréversible, enregistrée dans l'audit trail.")
+        df = read_full_results(conn)
+        if not df.empty:
+            selected = st.selectbox("Patient", sorted(df["usubjid"].unique().tolist()), key="anon_patient")
+            confirm = st.checkbox(f"Je confirme vouloir pseudonymiser {selected}")
+            if st.button("Pseudonymiser", disabled=not confirm):
+                ok = anonymize_patient(conn, selected, user_name)
+                if ok:
+                    st.success(f"{selected} a été pseudonymisé.")
+                    st.rerun()
+
+    with tab_consent:
+        st.caption("Journal des statuts de consentement (le document signé lui-même n'est "
+                    "PAS stocké ici, seule une référence).")
+        df = read_full_results(conn)
+        if not df.empty:
+            with st.form("consent_form"):
+                selected = st.selectbox("Patient", sorted(df["usubjid"].unique().tolist()), key="consent_patient")
+                patient_id = df[df["usubjid"] == selected].iloc[0]["patient_id"]
+                status = st.selectbox("Statut", ["GRANTED", "WITHDRAWN", "AMENDED"])
+                doc_ref = st.text_input("Référence du document (ex: nom de fichier, ID e-CRF)")
+                submitted = st.form_submit_button("Enregistrer")
+                if submitted:
+                    record_consent(conn, patient_id, selected, status, doc_ref, user_name)
+                    st.success("Consentement enregistré.")
+                    st.rerun()
+
+        st.subheader("Historique")
+        consent_df = get_all_consent(conn)
+        if consent_df.empty:
+            st.info("Aucun consentement enregistré.")
+        else:
+            st.dataframe(consent_df, use_container_width=True)
 
 
 def page_export_sdtm(conn, user_name):
@@ -825,12 +1058,30 @@ def page_automation(conn, user_name):
     critical_emails = st.text_input("Critical value alerts (comma-separated)",
                                       value=get_setting(conn, "notify_emails_critical", "") or "")
 
+    st.markdown("---")
+    st.subheader("Diffusion automatique des comptes rendus")
+    st.caption("⚠️ Envoi par e-mail SMTP classique avec PDF chiffré par mot de passe — ce "
+                "n'est PAS une messagerie de santé sécurisée MSSanté (voir automation.py). "
+                "À utiliser en connaissance de cause tant que vous n'avez pas d'accréditation.")
+    auto_send_enabled = get_setting(conn, "auto_send_reports_enabled", "0") == "1"
+    new_auto_send = st.toggle("Envoyer automatiquement le compte rendu après signature biologique",
+                                value=auto_send_enabled)
+    physician_emails = st.text_input("Destinataires des comptes rendus (comma-separated)",
+                                       value=get_setting(conn, "notify_emails_physician", "") or "")
+    report_password = st.text_input(
+        "Mot de passe de chiffrement des PDF (à communiquer séparément aux destinataires)",
+        value=get_setting(conn, "report_pdf_password", "") or "", type="password")
+
     if st.button("Save automation settings"):
         set_setting(conn, "automation_enabled", "1" if new_enabled else "0")
         set_setting(conn, "reminder_ingestion_days", str(new_threshold))
         set_setting(conn, "notify_emails_lab", lab_emails)
         set_setting(conn, "notify_emails_sponsor", sponsor_emails)
         set_setting(conn, "notify_emails_critical", critical_emails)
+        set_setting(conn, "auto_send_reports_enabled", "1" if new_auto_send else "0")
+        set_setting(conn, "notify_emails_physician", physician_emails)
+        if report_password:
+            set_setting(conn, "report_pdf_password", report_password)
         log_audit(conn, "SETTINGS", "UPDATE_AUTOMATION", user_name)
         st.success("Automation settings saved.")
         st.rerun()
@@ -956,6 +1207,8 @@ def main():
 
     if page == "Data Ingestion":
         page_ingestion(conn, username)
+    elif page == "HL7 Import":
+        page_hl7_import(conn, username)
     elif page == "Sample Labels":
         page_sample_labels(conn, username)
     elif page == "Sample Scan":
@@ -966,6 +1219,8 @@ def main():
         page_biological_validation(conn, username)
     elif page == "Dashboard":
         page_dashboard(conn)
+    elif page == "Process Flow":
+        page_process_flow(conn)
     elif page == "Patient Search":
         page_patient_search(conn)
     elif page == "Patient follow-up":
@@ -978,6 +1233,8 @@ def main():
         page_remarks(conn, username, role)
     elif page == "Export CDISC SDTM":
         page_export_sdtm(conn, username)
+    elif page == "Data Privacy":
+        page_data_privacy(conn, username)
     elif page == "Settings":
         page_settings(conn, username)
     elif page == "Automation":
