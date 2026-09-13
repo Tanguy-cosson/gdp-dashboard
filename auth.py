@@ -1,6 +1,6 @@
 """
 auth.py — Authentification, session, sécurité des comptes.
- 
+
 Trois mécanismes de sécurité ajoutés par rapport à la version initiale :
 1. Verrouillage temporaire après plusieurs échecs de connexion
    (protection brute-force absente auparavant).
@@ -9,27 +9,27 @@ Trois mécanismes de sécurité ajoutés par rapport à la version initiale :
    le mot de passe temporaire indéfiniment).
 3. "Mot de passe oublié" en self-service : jeton à usage unique envoyé
    par e-mail (via automation.send_email), valable 60 minutes.
- 
+
 Toujours pas de repli en clair sur le mot de passe : si bcrypt échoue,
 c'est un refus, point final.
 """
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
- 
+
 import bcrypt
 import streamlit as st
- 
+
 from audit import log_audit
 from constants import (LOGIN_LOCKOUT_MINUTES, LOGIN_LOCKOUT_THRESHOLD,
                         PASSWORD_RESET_TOKEN_MINUTES, ROLE_LABELS)
 from db import (clear_must_change_password, consume_password_reset_token,
                 create_password_reset_token, find_user_by_username_or_email,
                 record_login_failure, record_login_success)
- 
+
 SESSION_TIMEOUT_MINUTES = 30
- 
- 
+
+
 # ---------------------------------------------------------------------
 # Mots de passe
 # ---------------------------------------------------------------------
@@ -43,8 +43,8 @@ def validate_password_complexity(password):
     if not any(c.isdigit() for c in password):
         return False, "Password must contain at least one digit."
     return True, "OK"
- 
- 
+
+
 def generate_temp_password():
     """Mot de passe temporaire aléatoire qui respecte toujours la
     politique de complexité (utilisé par le CRO lors de la création
@@ -55,12 +55,12 @@ def generate_temp_password():
         ok, _ = validate_password_complexity(pwd)
         if ok:
             return pwd
- 
- 
+
+
 def hash_password(plain_password):
     return bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
- 
- 
+
+
 def check_password(plain_password, password_hash):
     """Aucun repli en clair : si le hash est absent/corrompu ou si la
     vérification échoue pour n'importe quelle raison, on refuse."""
@@ -70,8 +70,8 @@ def check_password(plain_password, password_hash):
         return bcrypt.checkpw(plain_password.encode("utf-8"), password_hash.encode("utf-8"))
     except Exception:
         return False
- 
- 
+
+
 def get_user_record(conn, username):
     cur = conn.execute(
         "SELECT role, full_name, password_hash, email, active, locked_until, "
@@ -85,14 +85,14 @@ def get_user_record(conn, username):
         "role": row[0], "full_name": row[1], "password_hash": row[2], "email": row[3],
         "active": bool(row[4]), "locked_until": row[5], "must_change_password": bool(row[6]),
     }
- 
- 
+
+
 def update_password(conn, username, new_password):
     new_hash = hash_password(new_password)
     conn.execute("UPDATE USERS SET password_hash = ? WHERE username = ?", (new_hash, username))
     conn.commit()
- 
- 
+
+
 def _is_locked(record):
     if not record.get("locked_until"):
         return False
@@ -100,8 +100,8 @@ def _is_locked(record):
     if locked_until.tzinfo is None:
         locked_until = locked_until.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) < locked_until
- 
- 
+
+
 # ---------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------
@@ -110,19 +110,19 @@ def session_expired():
         return False
     elapsed = datetime.now(timezone.utc) - st.session_state.last_activity
     return elapsed > timedelta(minutes=SESSION_TIMEOUT_MINUTES)
- 
- 
+
+
 def touch_session():
     st.session_state.last_activity = datetime.now(timezone.utc)
- 
- 
+
+
 def _reset_session():
     st.session_state.auth_username = None
     st.session_state.auth_role = None
     st.session_state.auth_full_name = None
     st.session_state.auth_must_change_password = False
- 
- 
+
+
 # ---------------------------------------------------------------------
 # Mot de passe oublié (self-service, par jeton e-mail)
 # ---------------------------------------------------------------------
@@ -134,13 +134,13 @@ def handle_password_reset_flow(conn):
     token = st.query_params.get("reset_token")
     if not token:
         return False
- 
+
     st.title("🔑 Reset your password")
     with st.form("reset_password_form"):
         new_pwd = st.text_input("New password", type="password")
         confirm_pwd = st.text_input("Confirm new password", type="password")
         submitted = st.form_submit_button("Set new password")
- 
+
     if submitted:
         if new_pwd != confirm_pwd:
             st.error("Passwords do not match.")
@@ -160,8 +160,8 @@ def handle_password_reset_flow(conn):
                     st.success("Password updated. You can close this tab and log in with your new password.")
                     st.query_params.clear()
     return True
- 
- 
+
+
 def _render_forgot_password(conn):
     with st.sidebar.expander("Forgot password?"):
         with st.form("forgot_password_form"):
@@ -188,18 +188,18 @@ def _render_forgot_password(conn):
                     )
                     log_audit(conn, "USERS", "PASSWORD_RESET_REQUESTED", username,
                               comment="email sent" if sent else "email not sent (SMTP not configured?)")
- 
- 
+
+
 # ---------------------------------------------------------------------
 # Connexion / sidebar
 # ---------------------------------------------------------------------
 def sidebar_user_identification(conn):
     st.sidebar.markdown('<div class="sidebar-login-title">🫆 Identifiant</div>',
                          unsafe_allow_html=True)
- 
+
     if "auth_username" not in st.session_state:
         _reset_session()
- 
+
     if st.session_state.auth_username:
         if session_expired():
             log_audit(conn, "USERS", "SESSION_TIMEOUT", st.session_state.auth_username)
@@ -209,9 +209,9 @@ def sidebar_user_identification(conn):
                 "Please log in again."
             )
             return None, None, None
- 
+
         touch_session()
- 
+
         # Changement de mot de passe forcé (réinitialisation par un admin CRO)
         if st.session_state.get("auth_must_change_password"):
             st.warning("⚠️ Your password was reset by an administrator. "
@@ -236,13 +236,13 @@ def sidebar_user_identification(conn):
                             st.success("Password updated.")
                             st.rerun()
             return None, None, None  # bloque l'accès au reste de l'appli tant que non résolu
- 
+
         st.sidebar.success(st.session_state.auth_full_name)
         st.sidebar.markdown(
             f'<span class="role-badge">{ROLE_LABELS.get(st.session_state.auth_role, "")}</span>',
             unsafe_allow_html=True,
         )
- 
+
         with st.sidebar.expander("Change my password"):
             with st.form("change_password_form"):
                 new_pwd = st.text_input("New password", type="password", key="new_pwd")
@@ -259,39 +259,39 @@ def sidebar_user_identification(conn):
                             update_password(conn, st.session_state.auth_username, new_pwd)
                             log_audit(conn, "USERS", "PASSWORD_CHANGED", st.session_state.auth_username)
                             st.sidebar.success("Password updated.")
- 
+
         if st.sidebar.button("Log out"):
             log_audit(conn, "USERS", "LOGOUT", st.session_state.auth_username)
             _reset_session()
             st.rerun()
- 
+
         return (st.session_state.auth_username, st.session_state.auth_role,
                 st.session_state.auth_full_name)
- 
+
     with st.sidebar.form("login_form"):
         username_input = st.text_input(
             "User identifiant", placeholder="e.g. lab_tech1 / biologist1 / physician1")
         password_input = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Log in")
- 
+
         if submitted:
             record = get_user_record(conn, username_input)
             if record is None:
                 st.sidebar.error("Incorrect username or password.")
                 log_audit(conn, "USERS", "LOGIN_FAILED", username_input or "(vide)")
                 return None, None, None
- 
+
             if not record["active"]:
                 st.sidebar.error("This account has been deactivated. Contact your CRO administrator.")
                 log_audit(conn, "USERS", "LOGIN_BLOCKED_INACTIVE", username_input)
                 return None, None, None
- 
+
             if _is_locked(record):
                 st.sidebar.error(f"Account temporarily locked after repeated failed attempts. "
                                   f"Try again in a few minutes.")
                 log_audit(conn, "USERS", "LOGIN_BLOCKED_LOCKED", username_input)
                 return None, None, None
- 
+
             if not check_password(password_input, record["password_hash"]):
                 just_locked = record_login_failure(conn, username_input,
                                                      LOGIN_LOCKOUT_THRESHOLD, LOGIN_LOCKOUT_MINUTES)
@@ -301,7 +301,7 @@ def sidebar_user_identification(conn):
                     log_audit(conn, "USERS", "ACCOUNT_LOCKED", username_input,
                               comment=f"{LOGIN_LOCKOUT_THRESHOLD} failed attempts")
                 return None, None, None
- 
+
             record_login_success(conn, username_input)
             st.session_state.auth_username = username_input
             st.session_state.auth_role = record["role"]
@@ -310,11 +310,10 @@ def sidebar_user_identification(conn):
             touch_session()
             log_audit(conn, "USERS", "LOGIN_SUCCESS", username_input)
             st.rerun()
- 
+
     _render_forgot_password(conn)
- 
+
     st.sidebar.markdown(
         '<div class="sidebar-login-hint">Please enter your username and password '
         'to continue.</div>', unsafe_allow_html=True)
     return None, None, None
- 

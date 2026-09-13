@@ -9,14 +9,17 @@ ROLE_LABELS = {
 }
 
 PAGE_PERMISSIONS = {
-    "LAB_TECH": ["Data Ingestion", "HL7 Import", "Sample Labels", "Sample Scan", "Technical Validation", "Process Flow"],
-    "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes", "Process Flow"],
-    "PHYSICIAN": ["Patient Records", "Notes"],
+    "LAB_TECH": ["Data Ingestion", "HL7 Import", "Sample Labels", "Sample Scan", "Technical Validation",
+                 "Process Flow", "Messagerie", "Mon Compte", "Guide"],
+    "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes",
+                  "Process Flow", "Messagerie", "Mon Compte", "Guide"],
+    "PHYSICIAN": ["Patient Records", "Notes", "Messagerie", "Mon Compte", "Guide"],
     "CRO": ["Dashboard", "Process Flow", "Patient Search", "Patient follow-up", "Sample Labels",
             "Sample Scan", "Technical Validation", "Biological Validation",
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
-            "Data Privacy", "Settings", "Automation", "User Management", "Audit Trail"],
-    "SPONSOR": ["VINC extraction", "Notes"],
+            "Data Privacy", "Messagerie", "Mon Compte", "Settings", "Automation",
+            "User Management", "Audit Trail", "Guide"],
+    "SPONSOR": ["VINC extraction", "Notes", "Messagerie", "Mon Compte", "Guide"],
 }
 
 # ---------------------------------------------------------------------
@@ -43,4 +46,27 @@ SIGNATURE_REASONS = [
     "Approved with comment",
     "Reviewed — repeat test requested",
     "Reviewed — investigator notified",
+]
+
+# ---------------------------------------------------------------------
+# Ergonomie : icônes de navigation (préfixées aux libellés de page dans
+# la barre latérale, pour un repérage plus rapide) et rappel des
+# comptes de démo affiché sur la page d'accueil.
+# ---------------------------------------------------------------------
+PAGE_ICONS = {
+    "Data Ingestion": "📥", "HL7 Import": "🔌", "Sample Labels": "🏷️",
+    "Sample Scan": "📷", "Process Flow": "🧭", "Technical Validation": "🧪",
+    "Biological Validation": "🧬", "Dashboard": "📊", "Patient Search": "🔍",
+    "Patient follow-up": "📋", "Patient Records": "👤", "VINC extraction": "📤",
+    "Notes": "📝", "Export CDISC SDTM": "📦", "Data Privacy": "🔒",
+    "Settings": "⚙️", "Automation": "🤖", "User Management": "👥",
+    "Audit Trail": "🕵️", "Guide": "❓", "Messagerie": "📧", "Mon Compte": "🪪",
+}
+
+DEMO_ACCOUNTS = [
+    ("lab_tech1", "labtech2026", "Technicien de laboratoire"),
+    ("biologist1", "bio2026", "Biologiste"),
+    ("physician1", "doc2026", "Médecin investigateur"),
+    ("cro_arc", "cro2026", "CRO (accès complet)"),
+    ("sponsor_lph", "sponsor2026", "Promoteur (Sponsor)"),
 ]

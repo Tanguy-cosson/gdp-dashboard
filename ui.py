@@ -5,6 +5,7 @@ import os
 
 import streamlit as st
 
+from constants import DEMO_ACCOUNTS
 from db import get_setting
 
 
@@ -289,6 +290,8 @@ def render_landing_page(conn):
     </div>
     """), unsafe_allow_html=True)
 
+    st.markdown(render_demo_accounts_table(), unsafe_allow_html=True)
+
 
 def kpi_card(label, value, icon, accent):
     return _html(f"""
@@ -296,5 +299,33 @@ def kpi_card(label, value, icon, accent):
         <span class="kpi-icon">{icon}</span>
         <div class="kpi-label">{label}</div>
         <div class="kpi-value">{value}</div>
+    </div>
+    """)
+
+
+def render_demo_accounts_table():
+    rows_html = "".join(
+        f'<tr><td style="padding:0.5rem 0.8rem;font-family:monospace;">{user}</td>'
+        f'<td style="padding:0.5rem 0.8rem;font-family:monospace;">{pwd}</td>'
+        f'<td style="padding:0.5rem 0.8rem;color:#7B8794;font-size:0.85rem;">{label}</td></tr>'
+        for user, pwd, label in DEMO_ACCOUNTS
+    )
+    return _html(f"""
+    <div class="lims-panel" style="max-width:820px;margin:0 auto 2rem auto;">
+        <h4>🔑 Essayer avec un compte de démonstration</h4>
+        <p style="font-size:0.88rem;color:#34495E;margin-bottom:0.8rem;">
+            Connectez-vous dans la barre latérale avec l'un de ces comptes pour explorer
+            l'application selon le point de vue de chaque rôle métier :
+        </p>
+        <table style="width:100%;border-collapse:collapse;font-size:0.88rem;">
+            <thead>
+                <tr style="border-bottom:2px solid #E3E8EE;">
+                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Utilisateur</th>
+                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Mot de passe</th>
+                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Rôle</th>
+                </tr>
+            </thead>
+            <tbody>{rows_html}</tbody>
+        </table>
     </div>
     """)

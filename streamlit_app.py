@@ -8,14 +8,15 @@ import streamlit as st
 from audit import log_audit
 from auth import (generate_temp_password, handle_password_reset_flow, hash_password,
                    sidebar_user_identification, validate_password_complexity)
-from automation import check_and_send_reminders, send_secure_report
+from automation import check_and_send_reminders, preview_automation, send_secure_report
 from barcode_utils import (decode_barcode_from_image, generate_barcode_png,
                             generate_sample_label_pdf, zbar_available)
 from business_logic import (build_patients_matrix, compute_oor_flag, compute_tat_hours,
                              validate_ingestion_dataframe)
 from cdisc_export import generate_define_xml, generate_dm_domain
 from constants import (ALL_ROLES, CRITICAL_FLAG, ESIGNATURE_LEGAL_NOTICE, NORMAL_FLAG,
-                        OOR_FLAG, PAGE_PERMISSIONS, ROLE_LABELS, SIGNATURE_REASONS, STUDYID)
+                        OOR_FLAG, PAGE_ICONS, PAGE_PERMISSIONS, ROLE_LABELS,
+                        SIGNATURE_REASONS, STUDYID)
 from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_status,
                 create_user, find_sample_by_barcode, get_connection,
                 get_current_storage_location, get_or_create_patient, get_or_create_sample,
@@ -26,6 +27,8 @@ from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_st
                 read_remarks, set_setting, set_user_active, set_user_role, username_exists)
 from gdpr import anonymize_patient, export_patient_data, get_all_consent, record_consent
 from hl7_import import parse_oru_r01, parse_ref_range
+from mailbox import (count_unread, get_inbox, get_message, list_active_usernames,
+                      mark_as_read, send_internal_message, send_internal_message_to_many)
 from pdf_reports import generate_patient_pdf_report, generate_vinc_pdf_report
 from ui import _html, inject_custom_css, kpi_card, render_landing_page, render_top_banner
 from workflow_viz import render_pipeline_svg, render_status_stepper
@@ -403,33 +406,53 @@ def page_biological_validation(conn, user_name):
 
 
 def _maybe_auto_send_reports(conn, result_ids, user_name):
-    """Si activé dans Settings/Automation, génère et envoie automatiquement
-    (PDF chiffré par mot de passe) le compte rendu des patients concernés
-    par cette signature biologique. Échoue silencieusement (log en audit
-    trail) si le SMTP ou le mot de passe ne sont pas configurés — ne doit
-    jamais bloquer la validation elle-même, qui est déjà actée en base."""
+    """Si activé dans Settings/Automation, génère et livre automatiquement
+    le compte rendu des patients concernés par cette signature biologique
+    dans la Messagerie interne des destinataires configurés (fonctionne
+    toujours, sans SMTP). Un e-mail SMTP réel chiffré par mot de passe
+    est envoyé EN PLUS si un mot de passe de chiffrement est configuré.
+    Échoue silencieusement (log en audit trail) — ne doit jamais bloquer
+    la validation elle-même, qui est déjà actée en base."""
     if get_setting(conn, "auto_send_reports_enabled", "0") != "1":
         return
-    recipients = (get_setting(conn, "notify_emails_physician", "") or "").split(",")
-    report_password = get_setting(conn, "report_pdf_password")
-    if not recipients or not any(r.strip() for r in recipients) or not report_password:
+    recipients = [r.strip() for r in (get_setting(conn, "notify_emails_physician", "") or "").split(",") if r.strip()]
+    if not recipients:
         return
 
+    report_password = get_setting(conn, "report_pdf_password")
     usubjids = get_usubjids_for_results(conn, result_ids)
     for usubjid in usubjids:
-        pdf_bytes = generate_patient_pdf_report(conn, usubjid, user_name, password=report_password)
-        if pdf_bytes is None:
-            continue
-        sent = send_secure_report(
-            subject=f"[BLOOD Study] Compte rendu biologique — {usubjid}",
-            body=(f"Le compte rendu biologique de {usubjid} vient d'être validé et signé. "
-                  f"Le PDF ci-joint est protégé par mot de passe (communiqué séparément)."),
-            recipients=recipients,
-            attachment_bytes=pdf_bytes,
-            attachment_filename=f"{usubjid}_report_{date.today()}.pdf",
-        )
-        log_audit(conn, "LAB_RESULTS", "REPORT_AUTO_SENT" if sent else "REPORT_AUTO_SEND_FAILED",
-                  user_name, record_ref=usubjid)
+        subject = f"Compte rendu biologique — {usubjid}"
+        body = f"Le compte rendu biologique de {usubjid} vient d'être validé et signé. Voir la pièce jointe."
+        filename = f"{usubjid}_report_{date.today()}.pdf"
+
+        # Livraison interne (toujours disponible, PDF non chiffré car déjà
+        # protégé par l'authentification de l'application)
+        pdf_bytes_internal = generate_patient_pdf_report(conn, usubjid, user_name)
+        n_delivered = 0
+        if pdf_bytes_internal is not None:
+            n_delivered = send_internal_message_to_many(
+                conn, recipients, subject, body,
+                sender_username=user_name, sender_label="Automatisation LIMS",
+                attachment_bytes=pdf_bytes_internal, attachment_name=filename,
+                attachment_mimetype="application/pdf",
+            )
+
+        # E-mail SMTP réel EN PLUS, si un mot de passe de chiffrement est configuré
+        also_emailed = False
+        if report_password and pdf_bytes_internal is not None:
+            pdf_bytes_encrypted = generate_patient_pdf_report(conn, usubjid, user_name, password=report_password)
+            also_emailed = send_secure_report(
+                subject=f"[BLOOD Study] {subject}",
+                body=body + " (PDF protégé par mot de passe, communiqué séparément.)",
+                recipients=recipients, attachment_bytes=pdf_bytes_encrypted,
+                attachment_filename=filename,
+            )
+
+        log_audit(conn, "LAB_RESULTS",
+                  "REPORT_AUTO_SENT" if (n_delivered or also_emailed) else "REPORT_AUTO_SEND_FAILED",
+                  user_name, record_ref=usubjid,
+                  comment=f"{n_delivered} message(s) interne(s){' + e-mail' if also_emailed else ''}")
 
 
 # =====================================================================
@@ -477,6 +500,187 @@ def page_process_flow(conn):
                     """), unsafe_allow_html=True)
                 if len(summary) > 15:
                     st.caption(f"... et {len(summary) - 15} de plus.")
+
+
+def page_mon_compte(conn, user_name, role, full_name):
+    """Espace personnel : informations de profil, poste, e-mail, et
+    changement de mot de passe. Le nom d'utilisateur et le rôle restent
+    en lecture seule ici — les modifier engage le contrôle d'accès de
+    toute l'application, c'est pour ça que c'est réservé au CRO via
+    User Management (voir la note affichée plus bas)."""
+    st.title("🪪 MON COMPTE")
+
+    cur = conn.execute(
+        "SELECT full_name, email, job_title FROM USERS WHERE username = ?", (user_name,)
+    )
+    row = cur.fetchone()
+    current_full_name, current_email, current_job_title = row if row else (full_name, "", "")
+
+    col_info, col_badge = st.columns([2, 1])
+    with col_info:
+        with st.form("mon_compte_form"):
+            new_full_name = st.text_input("Nom complet", value=current_full_name or "")
+            new_job_title = st.text_input("Poste / fonction", value=current_job_title or "",
+                                            placeholder="ex: Technicienne de laboratoire, Site FR-001")
+            new_email = st.text_input("E-mail", value=current_email or "")
+            submitted = st.form_submit_button("Enregistrer")
+            if submitted:
+                conn.execute(
+                    "UPDATE USERS SET full_name = ?, job_title = ?, email = ? WHERE username = ?",
+                    (new_full_name, new_job_title, new_email, user_name),
+                )
+                conn.commit()
+                log_audit(conn, "USERS", "PROFILE_UPDATED", user_name)
+                st.session_state.auth_full_name = new_full_name
+                st.success("Profil mis à jour.")
+                st.rerun()
+
+    with col_badge:
+        st.markdown(_html(f"""
+        <div class="lims-panel">
+            <h4>{current_full_name}</h4>
+            <p style="color:#7B8794;font-size:0.85rem;margin:0.2rem 0;">@{user_name}</p>
+            <span class="role-badge" style="background:#2E86C1;color:white;border:none;">{ROLE_LABELS.get(role, role)}</span>
+        </div>
+        """), unsafe_allow_html=True)
+
+    st.caption("ℹ️ Le nom d'utilisateur et le rôle ne sont pas modifiables ici — un changement "
+                "de rôle affecte les droits d'accès à toute l'application et reste réservé au "
+                "CRO (page User Management), par principe de séparation des responsabilités.")
+
+    st.markdown("---")
+    st.subheader("🔒 Changer mon mot de passe")
+    with st.form("mon_compte_password_form"):
+        new_pwd = st.text_input("Nouveau mot de passe", type="password")
+        confirm_pwd = st.text_input("Confirmer le nouveau mot de passe", type="password")
+        pwd_submitted = st.form_submit_button("Mettre à jour le mot de passe")
+        if pwd_submitted:
+            if new_pwd != confirm_pwd:
+                st.error("Les mots de passe ne correspondent pas.")
+            else:
+                ok, msg = validate_password_complexity(new_pwd)
+                if not ok:
+                    st.error(msg)
+                else:
+                    from auth import update_password
+                    update_password(conn, user_name, new_pwd)
+                    log_audit(conn, "USERS", "PASSWORD_CHANGED", user_name)
+                    st.success("Mot de passe mis à jour.")
+
+
+def page_messagerie(conn, user_name):
+    """Messagerie interne : reçoit réellement les relances de
+    l'automatisation (voir automation.py / mailbox.py) et permet
+    d'envoyer un message à un autre utilisateur de l'application —
+    même principe qu'une messagerie universitaire (compte du site,
+    pas un vrai fournisseur e-mail externe)."""
+    st.title("📧 MESSAGERIE")
+
+    tab_inbox, tab_compose = st.tabs(["📥 Boîte de réception", "✉️ Nouveau message"])
+
+    with tab_inbox:
+        inbox = get_inbox(conn, user_name)
+        if inbox.empty:
+            st.info("Aucun message pour l'instant.")
+        else:
+            for _, row in inbox.iterrows():
+                unread = not bool(row["is_read"])
+                label = f"{'🔵 ' if unread else ''}{row['subject']} — {row['sender_label']} · {row['created_at'][:16].replace('T', ' ')}"
+                with st.expander(label):
+                    msg = get_message(conn, int(row["message_id"]), user_name)
+                    if not row["is_read"]:
+                        mark_as_read(conn, int(row["message_id"]), user_name)
+                    st.write(msg["body"])
+                    if msg["attachment_name"]:
+                        st.download_button(
+                            f"⬇️ {msg['attachment_name']}", msg["attachment_data"],
+                            file_name=msg["attachment_name"],
+                            mime=msg["attachment_mimetype"] or "application/octet-stream",
+                            key=f"dl_msg_{msg['message_id']}",
+                        )
+
+    with tab_compose:
+        recipients = list_active_usernames(conn, exclude_username=user_name)
+        if not recipients:
+            st.info("Aucun autre utilisateur actif à qui écrire.")
+        else:
+            with st.form("compose_form"):
+                options = {f"{full_name} (@{uname}) — {ROLE_LABELS.get(role, role)}": uname
+                           for uname, full_name, role in recipients}
+                choice = st.selectbox("Destinataire", list(options.keys()))
+                subject = st.text_input("Objet")
+                body = st.text_area("Message")
+                submitted = st.form_submit_button("Envoyer")
+                if submitted:
+                    if not subject or not body:
+                        st.error("Objet et message sont obligatoires.")
+                    else:
+                        sender_row = conn.execute(
+                            "SELECT full_name FROM USERS WHERE username = ?", (user_name,)
+                        ).fetchone()
+                        sender_label = sender_row[0] if sender_row else user_name
+                        send_internal_message(conn, options[choice], subject, body,
+                                               sender_username=user_name, sender_label=sender_label)
+                        log_audit(conn, "MESSAGES", "MESSAGE_SENT", user_name,
+                                  record_ref=options[choice])
+                        st.success("Message envoyé.")
+                        st.rerun()
+
+
+def page_guide(role):
+    """Aide contextuelle intégrée : condensé du guide complet, adapté à
+    ce que CE rôle voit réellement. Objectif : qu'un nouvel utilisateur
+    (ou un visiteur en démo) comprenne le 'pourquoi' sans quitter l'appli."""
+    st.title("❓ GUIDE")
+    st.caption("Un guide complet et détaillé (avec glossaire et scénario de démonstration) "
+                "est disponible séparément — demandez-le si besoin.")
+
+    st.subheader("Le principe général")
+    st.write(
+        "Chaque résultat suit un même trajet : **Ingestion** (CSV ou HL7) → "
+        "**Échantillon + code-barres** → **Validation technique** → "
+        "**Validation biologique (signature électronique)** → **Diffusion** "
+        "(dossier patient, export sponsor, export réglementaire CDISC). "
+        "Chaque étape existe pour une raison réglementaire précise : la double "
+        "validation (technicien puis biologiste) est l'exigence classique de "
+        "vérification indépendante en biologie médicale et en essai clinique."
+    )
+
+    role_help = {
+        "LAB_TECH": [
+            ("📥 Data Ingestion", "Importez le fichier CSV hebdomadaire du laboratoire central. "
+             "Tout est vérifié AVANT d'être écrit en base — si une ligne est invalide, rien n'est importé."),
+            ("🔌 HL7 Import", "Alternative au CSV si votre labo envoie directement un message HL7 v2."),
+            ("🏷️ Sample Labels", "Imprimez les étiquettes code-barres des nouveaux échantillons reçus."),
+            ("📷 Sample Scan", "Scannez (ou tapez) un code-barres pour retrouver instantanément un échantillon."),
+            ("🧪 Technical Validation", "Premier contrôle qualité : cochez les résultats plausibles pour les faire avancer."),
+        ],
+        "BIOLOGIST": [
+            ("🧬 Biological Validation", "Validation médicale finale. Cochez les résultats à signer, choisissez le motif "
+             "de signature, ressaisissez votre mot de passe — cette signature a la même valeur qu'une signature manuscrite."),
+            ("👤 Patient Records", "Consultez le dossier complet d'un patient et la tendance de ses biomarqueurs."),
+        ],
+        "PHYSICIAN": [
+            ("👤 Patient Records", "Suivez vos patients inclus dans l'essai : résultats validés, tendance dans le temps, rapport PDF."),
+            ("📝 Notes", "Ajoutez une observation clinique horodatée sur un résultat."),
+        ],
+        "CRO": [
+            ("📊 Dashboard", "KPI globaux : nombre de résultats, patients, valeurs critiques, délai moyen de traitement."),
+            ("🧭 Process Flow", "Le pipeline en un coup d'œil, avec les compteurs en direct."),
+            ("👥 User Management", "Créez ou désactivez des comptes, réinitialisez un mot de passe."),
+            ("📦 Export CDISC SDTM", "Export réglementaire (domaines LB, DM) + define.xml, prêt pour un dépôt."),
+            ("🔒 Data Privacy", "Droits RGPD : export des données d'un patient, pseudonymisation, consentement."),
+            ("🕵️ Audit Trail", "Le journal de TOUT ce qui s'est passé — non modifiable, non supprimable."),
+        ],
+        "SPONSOR": [
+            ("📤 VINC extraction", "Votre extrait mensuel des résultats de la visite d'inclusion (VINC)."),
+        ],
+    }
+
+    for title, explanation in role_help.get(role, []):
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.caption(explanation)
 
 
 def page_dashboard(conn):
@@ -1039,9 +1243,10 @@ def page_settings(conn, user_name):
 
 def page_automation(conn, user_name):
     st.title("AUTOMATION")
-    st.caption("Automatic e-mail reminders. Requires SMTP credentials configured in "
-                ".streamlit/secrets.toml (see README) — without them, this page still "
-                "lets you configure recipients and thresholds, but no e-mail will be sent.")
+    st.caption("Les relances sont livrées dans la Messagerie interne des destinataires "
+                "choisis ci-dessous — ça fonctionne réellement, sans avoir besoin d'un "
+                "vrai serveur e-mail. Un envoi SMTP réel est fait EN PLUS si vous configurez "
+                "un jour de vrais identifiants dans .streamlit/secrets.toml.")
 
     enabled = get_setting(conn, "automation_enabled", "1") == "1"
     new_enabled = st.toggle("Enable automated reminders", value=enabled)
@@ -1050,46 +1255,65 @@ def page_automation(conn, user_name):
     new_threshold = st.number_input("Days before an 'ingestion overdue' reminder is sent",
                                       min_value=1, max_value=60, value=threshold)
 
-    st.subheader("Recipients")
-    lab_emails = st.text_input("Lab ingestion reminders (comma-separated)",
-                                 value=get_setting(conn, "notify_emails_lab", "") or "")
-    sponsor_emails = st.text_input("Sponsor VINC reminders (comma-separated)",
-                                     value=get_setting(conn, "notify_emails_sponsor", "") or "")
-    critical_emails = st.text_input("Critical value alerts (comma-separated)",
-                                      value=get_setting(conn, "notify_emails_critical", "") or "")
+    st.subheader("Destinataires")
+    account_rows = list_active_usernames(conn)
+    account_options = {f"{fname} (@{uname})": uname for uname, fname, role in account_rows}
+    label_by_username = {uname: label for label, uname in account_options.items()}
+
+    def _preselect(setting_key):
+        raw = (get_setting(conn, setting_key, "") or "").split(",")
+        return [label_by_username[u.strip()] for u in raw if u.strip() in label_by_username]
+
+    lab_labels = st.multiselect("Relance import hebdomadaire en retard",
+                                  list(account_options.keys()), default=_preselect("notify_emails_lab"))
+    sponsor_labels = st.multiselect("Relance extrait VINC mensuel",
+                                      list(account_options.keys()), default=_preselect("notify_emails_sponsor"))
+    critical_labels = st.multiselect("Alerte valeurs critiques",
+                                       list(account_options.keys()), default=_preselect("notify_emails_critical"))
 
     st.markdown("---")
     st.subheader("Diffusion automatique des comptes rendus")
-    st.caption("⚠️ Envoi par e-mail SMTP classique avec PDF chiffré par mot de passe — ce "
-                "n'est PAS une messagerie de santé sécurisée MSSanté (voir automation.py). "
-                "À utiliser en connaissance de cause tant que vous n'avez pas d'accréditation.")
+    st.caption("Livré dans la Messagerie interne du destinataire, avec le PDF en pièce jointe. "
+                "⚠️ Ce n'est pas une messagerie de santé sécurisée MSSanté — voir README.")
     auto_send_enabled = get_setting(conn, "auto_send_reports_enabled", "0") == "1"
     new_auto_send = st.toggle("Envoyer automatiquement le compte rendu après signature biologique",
                                 value=auto_send_enabled)
-    physician_emails = st.text_input("Destinataires des comptes rendus (comma-separated)",
-                                       value=get_setting(conn, "notify_emails_physician", "") or "")
-    report_password = st.text_input(
-        "Mot de passe de chiffrement des PDF (à communiquer séparément aux destinataires)",
-        value=get_setting(conn, "report_pdf_password", "") or "", type="password")
+    physician_labels = st.multiselect("Destinataires des comptes rendus",
+                                        list(account_options.keys()), default=_preselect("notify_emails_physician"))
 
     if st.button("Save automation settings"):
         set_setting(conn, "automation_enabled", "1" if new_enabled else "0")
         set_setting(conn, "reminder_ingestion_days", str(new_threshold))
-        set_setting(conn, "notify_emails_lab", lab_emails)
-        set_setting(conn, "notify_emails_sponsor", sponsor_emails)
-        set_setting(conn, "notify_emails_critical", critical_emails)
+        set_setting(conn, "notify_emails_lab", ",".join(account_options[l] for l in lab_labels))
+        set_setting(conn, "notify_emails_sponsor", ",".join(account_options[l] for l in sponsor_labels))
+        set_setting(conn, "notify_emails_critical", ",".join(account_options[l] for l in critical_labels))
         set_setting(conn, "auto_send_reports_enabled", "1" if new_auto_send else "0")
-        set_setting(conn, "notify_emails_physician", physician_emails)
-        if report_password:
-            set_setting(conn, "report_pdf_password", report_password)
+        set_setting(conn, "notify_emails_physician", ",".join(account_options[l] for l in physician_labels))
         log_audit(conn, "SETTINGS", "UPDATE_AUTOMATION", user_name)
         st.success("Automation settings saved.")
         st.rerun()
 
     st.markdown("---")
-    st.caption("Known limitation: reminders are checked once per page load (no server-side "
-                "cron on the free Streamlit Community Cloud tier) — see README for how to add "
-                "a true scheduled trigger via GitHub Actions.")
+    st.subheader("🔍 Aperçu (sans rien envoyer)")
+    st.caption("Montre ce qui se déclencherait MAINTENANT, avec vos données actuelles.")
+    if st.button("Générer l'aperçu"):
+        preview = preview_automation(conn)
+        for item in preview:
+            icon = "🔔" if item["would_trigger"] else "✅"
+            with st.container(border=True):
+                st.markdown(f"{icon} **{item['title']}**")
+                st.caption(item["detail"])
+                if item["would_trigger"]:
+                    recipients = [r.strip() for r in item["recipients"] if r.strip()]
+                    if recipients:
+                        st.write(f"→ Serait livré dans la messagerie de : {', '.join(recipients)}")
+                    else:
+                        st.write("→ Se déclencherait, mais aucun destinataire n'est configuré ci-dessus.")
+
+    st.markdown("---")
+    st.caption("Limite connue : les relances sont vérifiées à chaque chargement de page (pas de "
+                "vrai cron serveur sur le tier gratuit Streamlit) — mais la livraison en "
+                "messagerie interne, elle, fonctionne réellement dès qu'une page est ouverte.")
 
 
 def page_audit_trail(conn):
@@ -1199,7 +1423,15 @@ def main():
     render_top_banner(conn, f"{full_name} · {ROLE_LABELS.get(role, role)}", notif_count)
 
     allowed_pages = PAGE_PERMISSIONS.get(role, [])
-    page = st.sidebar.radio("Navigation", allowed_pages)
+    unread = count_unread(conn, username)
+
+    def _format_page_label(p):
+        label = f"{PAGE_ICONS.get(p, '')} {p}"
+        if p == "Messagerie" and unread:
+            label += f" ({unread})"
+        return label
+
+    page = st.sidebar.radio("Navigation", allowed_pages, format_func=_format_page_label)
     st.sidebar.markdown("---")
     st.sidebar.caption("Access in accordance with the principle of least privilege "
                         "(21 CFR Part 11 / Annex 11 §12). "
@@ -1243,6 +1475,12 @@ def main():
         page_user_management(conn, username)
     elif page == "Audit Trail":
         page_audit_trail(conn)
+    elif page == "Guide":
+        page_guide(role)
+    elif page == "Messagerie":
+        page_messagerie(conn, username)
+    elif page == "Mon Compte":
+        page_mon_compte(conn, username, role, full_name)
 
 
 if __name__ == "__main__":

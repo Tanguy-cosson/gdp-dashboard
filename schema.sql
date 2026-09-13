@@ -173,11 +173,31 @@ CREATE TABLE IF NOT EXISTS USERS (
                               ('LAB_TECH', 'BIOLOGIST', 'PHYSICIAN', 'CRO', 'SPONSOR')),
     password_hash              TEXT NOT NULL,
     email                        TEXT,
+    job_title                     TEXT,
     active                        INTEGER NOT NULL DEFAULT 1,
     failed_login_count             INTEGER NOT NULL DEFAULT 0,
     locked_until                     TEXT,
     must_change_password               INTEGER NOT NULL DEFAULT 0,
     created_at                           TEXT DEFAULT (datetime('now'))
+);
+
+-- Messagerie interne (voir mailbox.py). Sert de destination réelle
+-- pour l'automatisation (relances, comptes rendus) tant qu'aucun
+-- vrai serveur SMTP n'est configuré — et reste utile ensuite comme
+-- canal de communication interne à l'application.
+CREATE TABLE IF NOT EXISTS MESSAGES (
+    message_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_username     TEXT NOT NULL,
+    sender_username           TEXT,
+    sender_label                 TEXT NOT NULL,
+    subject                         TEXT NOT NULL,
+    body                               TEXT NOT NULL,
+    attachment_name                      TEXT,
+    attachment_data                         BLOB,
+    attachment_mimetype                        TEXT,
+    is_read                                       INTEGER NOT NULL DEFAULT 0,
+    created_at                                       TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (recipient_username) REFERENCES USERS(username)
 );
 
 -- Jetons de réinitialisation de mot de passe à usage unique (flux

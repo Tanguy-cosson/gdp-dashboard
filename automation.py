@@ -1,5 +1,15 @@
 """
-automation.py — Relances automatiques par e-mail.
+automation.py — Relances automatiques.
+
+Canal principal : la messagerie interne (mailbox.py) — chaque relance
+est réellement livrée dans la boîte de réception du destinataire
+configuré, sans dépendre d'un SMTP externe. C'est ce qui permet à
+l'automatisation de fonctionner pour de vrai, y compris en démo, sans
+identifiants de messagerie réels.
+
+Canal secondaire (optionnel) : un vrai e-mail SMTP est envoyé EN PLUS
+si des identifiants sont configurés dans st.secrets["smtp"] — les deux
+canaux ne s'excluent pas.
 
 Limite assumée du compte Streamlit Community Cloud gratuit : il n'y a
 pas de vrai cron côté serveur (l'appli peut être mise en veille). La
@@ -7,15 +17,12 @@ stratégie retenue est donc "vérifier à chaque chargement de page" :
 check_and_send_reminders() est appelée une fois au démarrage de main().
 Un throttle (SETTINGS.last_reminder_*) évite d'envoyer plusieurs fois
 la même relance le même jour, même si plusieurs personnes ouvrent
-l'appli. Pour une vraie exécution planifiée indépendante des visites
-(ex: tous les jours à 8h même si personne n'ouvre l'appli), il faudra
-migrer vers un backend avec un scheduler externe (GitHub Actions cron
-appelant un script qui se connecte à une base partagée, ou Streamlit
-Cloud payant avec un worker séparé) — voir README, section "Limites
-connues".
+l'appli.
 
-Toute erreur SMTP est absorbée : l'automatisation ne doit jamais faire
-planter l'application pour les utilisateurs métier.
+Les listes de destinataires (SETTINGS.notify_*) contiennent désormais
+des NOMS D'UTILISATEUR internes (usernames), pas des adresses e-mail —
+voir page Automation pour les configurer via une liste déroulante des
+comptes existants.
 """
 import smtplib
 from datetime import date, datetime, timezone
@@ -30,6 +37,7 @@ from business_logic import compute_oor_flag
 from constants import CRITICAL_FLAG
 from db import (count_by_status, get_setting, now_utc_iso, read_audit_trail,
                  read_full_results, set_setting)
+from mailbox import send_internal_message_to_many
 
 
 def _smtp_configured():
@@ -137,14 +145,75 @@ def _already_sent_today(conn, key):
 
 def check_and_send_reminders(conn):
     """À appeler une fois par rendu de main(). Toutes les conditions
-    sont silencieuses si l'automatisation est désactivée ou si le SMTP
-    n'est pas configuré (mode dégradé, pas d'erreur visible)."""
+    sont silencieuses si l'automatisation est désactivée (mode dégradé, pas d'erreur visible)."""
     if get_setting(conn, "automation_enabled", "1") != "1":
         return
 
     _check_ingestion_overdue(conn)
     _check_sponsor_extract(conn)
     _check_critical_pending(conn)
+
+
+def preview_automation(conn):
+    """Mode aperçu (dry-run) : exécute la MÊME logique de détection que
+    check_and_send_reminders, mais SANS rien envoyer, sans toucher au
+    throttle, et sans écrire dans l'audit trail. Utile en démonstration
+    ou en configuration : on voit exactement ce qui se déclencherait,
+    même sans SMTP configuré (le blocage réel se ferait uniquement à
+    l'étape d'envoi, jamais à l'étape de détection)."""
+    results = []
+
+    threshold_days = int(get_setting(conn, "reminder_ingestion_days", "7"))
+    audit_df = read_audit_trail(conn)
+    ingestion_rows = audit_df[audit_df["action"] == "INGESTION_CSV"] if not audit_df.empty else audit_df
+    if ingestion_rows is None or ingestion_rows.empty:
+        overdue, detail = True, "Aucun import CSV n'a jamais été enregistré."
+    else:
+        last_dt = datetime.fromisoformat(ingestion_rows.iloc[0]["event_timestamp"])
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        days = (datetime.now(timezone.utc) - last_dt).days
+        overdue = days >= threshold_days
+        detail = f"Dernier import il y a {days} jour(s) (seuil : {threshold_days})."
+    results.append({
+        "title": "Import hebdomadaire en retard",
+        "would_trigger": overdue,
+        "detail": detail,
+        "recipients": (get_setting(conn, "notify_emails_lab", "") or "").split(","),
+    })
+
+    cur = conn.execute(
+        "SELECT MAX(event_timestamp) FROM AUDIT_TRAIL "
+        "WHERE action IN ('EXPORT_VINC_CRO','CONSULTATION_VINC_SPONSOR') "
+        "AND strftime('%Y-%m', event_timestamp) = strftime('%Y-%m', 'now')"
+    )
+    row = cur.fetchone()
+    already_done = bool(row and row[0])
+    past_20th = date.today().day >= 20
+    results.append({
+        "title": "Extrait VINC mensuel non téléchargé",
+        "would_trigger": (not already_done) and past_20th,
+        "detail": ("Déjà exporté/consulté ce mois-ci." if already_done else
+                   f"Pas encore exporté ce mois-ci (relance à partir du 20 — {'atteint' if past_20th else 'pas encore atteint'})."),
+        "recipients": (get_setting(conn, "notify_emails_sponsor", "") or "").split(","),
+    })
+
+    df = read_full_results(conn)
+    n_critical, patients = 0, 0
+    if not df.empty:
+        flagged = compute_oor_flag(df)
+        unresolved = flagged[(flagged["Alerte"] == CRITICAL_FLAG) & (flagged["status"] != "REVIEWED")]
+        n_critical = len(unresolved)
+        patients = unresolved["usubjid"].nunique() if n_critical else 0
+    results.append({
+        "title": "Valeur(s) critique(s) en attente de validation",
+        "would_trigger": n_critical > 0,
+        "detail": (f"{n_critical} valeur(s) critique(s) sur {patients} patient(s)." if n_critical
+                   else "Aucune valeur critique non résolue actuellement."),
+        "recipients": (get_setting(conn, "notify_emails_critical", "") or "").split(","),
+    })
+
+    return results
 
 
 def _check_ingestion_overdue(conn):
@@ -168,15 +237,17 @@ def _check_ingestion_overdue(conn):
         return
 
     recipients = (get_setting(conn, "notify_emails_lab", "") or "").split(",")
-    sent = _send_email(
-        subject="[BLOOD Study] Weekly lab file overdue",
-        body=(f"No CSV ingestion has been recorded in the last {threshold_days} day(s). "
-              f"Please submit the weekly Central Lab file."),
-        recipients=recipients,
-    )
-    if sent:
+    subject = "Import hebdomadaire en retard"
+    body = (f"Aucun import CSV n'a été enregistré depuis au moins {threshold_days} jour(s). "
+            f"Merci de déposer le fichier hebdomadaire du laboratoire central.")
+    n_delivered = send_internal_message_to_many(conn, recipients, subject, body)
+    also_emailed = _send_email(subject=f"[BLOOD Study] {subject}", body=body, recipients=recipients)
+
+    if n_delivered or also_emailed:
         set_setting(conn, "last_reminder_ingestion_sent", now_utc_iso())
-        log_audit(conn, "AUTOMATION", "REMINDER_SENT", "system", comment="ingestion_overdue")
+        log_audit(conn, "AUTOMATION", "REMINDER_SENT", "system",
+                  comment=f"ingestion_overdue -> {n_delivered} message(s) interne(s)"
+                          f"{' + e-mail' if also_emailed else ''}")
 
 
 def _check_sponsor_extract(conn):
@@ -196,14 +267,16 @@ def _check_sponsor_extract(conn):
         return
 
     recipients = (get_setting(conn, "notify_emails_sponsor", "") or "").split(",")
-    sent = _send_email(
-        subject="[BLOOD Study] Monthly VINC extract not yet retrieved",
-        body="The VINC extract for this month has not been downloaded or consulted yet.",
-        recipients=recipients,
-    )
-    if sent:
+    subject = "Extrait VINC mensuel non téléchargé"
+    body = "L'extrait VINC de ce mois-ci n'a pas encore été téléchargé ni consulté."
+    n_delivered = send_internal_message_to_many(conn, recipients, subject, body)
+    also_emailed = _send_email(subject=f"[BLOOD Study] {subject}", body=body, recipients=recipients)
+
+    if n_delivered or also_emailed:
         set_setting(conn, "last_reminder_sponsor_sent", now_utc_iso())
-        log_audit(conn, "AUTOMATION", "REMINDER_SENT", "system", comment="sponsor_extract")
+        log_audit(conn, "AUTOMATION", "REMINDER_SENT", "system",
+                  comment=f"sponsor_extract -> {n_delivered} message(s) interne(s)"
+                          f"{' + e-mail' if also_emailed else ''}")
 
 
 def _check_critical_pending(conn):
@@ -220,12 +293,14 @@ def _check_critical_pending(conn):
     recipients = (get_setting(conn, "notify_emails_critical", "") or "").split(",")
     n = len(unresolved)
     patients = unresolved["usubjid"].nunique()
-    sent = _send_email(
-        subject=f"[BLOOD Study] {n} CRITICAL value(s) pending validation",
-        body=(f"{n} critical (panic) value(s) across {patients} patient(s) are still "
-              f"awaiting validation. Immediate attention required."),
-        recipients=recipients,
-    )
-    if sent:
+    subject = f"{n} valeur(s) CRITIQUE(S) en attente de validation"
+    body = (f"{n} valeur(s) critique(s) (panic values) sur {patients} patient(s) sont encore en "
+            f"attente de validation. Attention immédiate requise.")
+    n_delivered = send_internal_message_to_many(conn, recipients, subject, body)
+    also_emailed = _send_email(subject=f"[BLOOD Study] {subject}", body=body, recipients=recipients)
+
+    if n_delivered or also_emailed:
         set_setting(conn, "last_reminder_critical_sent", now_utc_iso())
-        log_audit(conn, "AUTOMATION", "REMINDER_SENT", "system", comment="critical_pending")
+        log_audit(conn, "AUTOMATION", "REMINDER_SENT", "system",
+                  comment=f"critical_pending -> {n_delivered} message(s) interne(s)"
+                          f"{' + e-mail' if also_emailed else ''}")

@@ -88,12 +88,49 @@ def _migration_2_gdpr_and_hl7(conn):
     conn.commit()
 
 
+def _migration_3_internal_mailbox(conn):
+    """Ajoute la messagerie interne (voir mailbox.py) et le champ
+    'poste' sur les utilisateurs, pour l'espace Mon Compte."""
+    if not _column_exists(conn, "USERS", "job_title"):
+        conn.execute("ALTER TABLE USERS ADD COLUMN job_title TEXT")
+    if not _table_exists(conn, "MESSAGES"):
+        conn.execute("""
+            CREATE TABLE MESSAGES (
+                message_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_username     TEXT NOT NULL,
+                sender_username           TEXT,
+                sender_label                 TEXT NOT NULL,
+                subject                         TEXT NOT NULL,
+                body                               TEXT NOT NULL,
+                attachment_name                      TEXT,
+                attachment_data                         BLOB,
+                attachment_mimetype                        TEXT,
+                is_read                                       INTEGER NOT NULL DEFAULT 0,
+                created_at                                       TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (recipient_username) REFERENCES USERS(username)
+            )
+        """)
+    conn.commit()
+
+
+def _migration_4_audit_record_ref(conn):
+    """Ajoute AUDIT_TRAIL.record_ref — présente dans schema.sql depuis
+    le début de nos échanges, mais jamais migrée pour les bases créées
+    avant cet ajout (c'est ce qui a provoqué l'erreur 'no column named
+    record_ref' en production)."""
+    if not _column_exists(conn, "AUDIT_TRAIL", "record_ref"):
+        conn.execute("ALTER TABLE AUDIT_TRAIL ADD COLUMN record_ref TEXT")
+    conn.commit()
+
+
 # (version, nom, fonction). Toujours ajouter en fin de liste, ne
 # jamais modifier une migration déjà publiée — en écrire une nouvelle
 # à la place si un correctif est nécessaire.
 MIGRATIONS = [
     (1, "user_management_and_password_reset", _migration_1_user_management),
     (2, "gdpr_and_hl7", _migration_2_gdpr_and_hl7),
+    (3, "internal_mailbox", _migration_3_internal_mailbox),
+    (4, "audit_record_ref", _migration_4_audit_record_ref),
 ]
 
 
@@ -105,6 +142,8 @@ def run_migrations(conn):
     checks = {
         1: lambda: not _column_exists(conn, "USERS", "active"),
         2: lambda: not _column_exists(conn, "PATIENTS", "anonymized"),
+        3: lambda: not _column_exists(conn, "USERS", "job_title"),
+        4: lambda: not _column_exists(conn, "AUDIT_TRAIL", "record_ref"),
     }
     for version, name, migration_fn in MIGRATIONS:
         was_missing = checks.get(version, lambda: True)()

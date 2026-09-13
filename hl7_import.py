@@ -1,15 +1,40 @@
 """
 hl7_import.py — Import de résultats via message HL7 v2.x (ORU^R01).
 
+Ce module lit et interprète le format texte HL7 v2 (segments MSH,
+PID, OBR, OBX) tel qu'émis par la plupart des automates de laboratoire
+et des LIS. Il transforme un message en une structure Python simple,
+prête à être revue et importée par l'utilisateur — exactement comme
+le fait déjà l'ingestion CSV.
+
 CE QUE CE MODULE FAIT : parser un message HL7 déjà reçu (fichier
-.hl7/.txt).
+.hl7/.txt, par exemple exporté manuellement depuis l'automate, ou
+transmis par un opérateur/middleware existant du laboratoire).
 
 CE QUE CE MODULE NE FAIT PAS : écouter un port réseau ou série en
 temps réel (MLLP/RS-232) pour recevoir les messages automatiquement
 depuis l'automate. Cette écoute doit tourner en permanence sur une
 machine du réseau du laboratoire — ce n'est pas compatible avec une
-application Streamlit (Cloud ou non). Un vrai lien temps réel
-nécessite un petit service dédié hébergé dans le réseau du labo.
+application Streamlit (Cloud ou non), qui répond aux requêtes HTTP
+d'un utilisateur mais n'est pas un service réseau persistant. Un vrai
+lien temps réel nécessite un petit service dédié (ex: Python +
+`hl7apy` + socket MLLP) hébergé dans le réseau du labo, qui pourrait
+ensuite écrire dans la même base ou appeler cette fonction de parsing.
+
+Format HL7 v2 attendu (segments séparés par retour à la ligne, champs
+par '|', composants par '^') :
+
+    MSH|^~\\&|ANALYZER|LAB|LIMS|SITE|20260301120000||ORU^R01|MSG00001|P|2.3
+    PID|1||P-0001^^^SITE^MR||DOE^JOHN||19800101|M
+    OBR|1|ORD001|ORD001|PANEL^Blood Panel|||20260301120000
+    OBX|1|NM|HBA1C^Hemoglobin A1c||5.4|%|4.0-6.0|N|||F
+    OBX|2|NM|GLUC^Fasting Glucose||5.1|mmol/L|3.9-5.6|N|||F
+
+La correspondance avec VOS visites d'essai clinique (VINC/V1/V2)
+n'existe pas dans le standard HL7 — ce n'est pas un oubli de ce
+parseur, c'est l'automate qui ne connaît pas votre plan de visites.
+Cette correspondance est donc demandée à l'utilisateur au moment de
+l'import (comme le ferait n'importe quel LIS en production).
 """
 from dataclasses import dataclass, field
 
@@ -41,7 +66,8 @@ def _split_fields(segment_line, sep="|"):
 def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
     """Parse un message HL7 v2 ORU^R01. Tolérant : les segments ou
     champs absents/mal formés génèrent un avertissement dans
-    `warnings` plutôt qu'une exception."""
+    `warnings` plutôt qu'une exception, pour que l'utilisateur voie
+    tout de suite ce qui n'a pas pu être lu."""
     result = HL7ParsedMessage()
     lines = [l.strip() for l in raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if l.strip()]
 
@@ -68,6 +94,7 @@ def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
         elif segment_id == "PID":
             fields = _split_fields(line)
             if len(fields) > 3 and fields[3]:
+                # PID-3 : identifiant patient, format "ID^^^AUTORITE^TYPE"
                 result.patient_identifier = fields[3].split("^")[0]
             else:
                 result.warnings.append("Segment PID sans identifiant patient (PID-3 vide).")
@@ -117,8 +144,9 @@ def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
 
 
 def parse_ref_range(ref_range: str):
-    """Convertit '4.0-6.0' en (ref_low, ref_high). Renvoie (None, None)
-    si le format n'est pas reconnu."""
+    """Convertit '4.0-6.0' (format HL7 OBX-7 standard) en (ref_low, ref_high).
+    Renvoie (None, None) si le format n'est pas reconnu — ce n'est pas
+    une erreur bloquante, juste une donnée optionnelle absente."""
     if not ref_range or "-" not in ref_range:
         return None, None
     try:
@@ -126,4 +154,3 @@ def parse_ref_range(ref_range: str):
         return float(low_str.strip()), float(high_str.strip())
     except ValueError:
         return None, None
-    
