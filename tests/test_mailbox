@@ -1,0 +1,89 @@
+"""Tests de mailbox.py — messagerie interne. Chaque test reçoit une
+base fraîche via la fixture `conn` (voir conftest.py)."""
+import db
+import mailbox
+
+
+def test_send_and_receive_message(conn):
+    mailbox.send_internal_message(conn, "biologist1", "Sujet", "Corps",
+                                   sender_username="lab_tech1", sender_label="Technicien")
+    inbox = mailbox.get_inbox(conn, "biologist1")
+    assert len(inbox) == 1
+    assert inbox.iloc[0]["subject"] == "Sujet"
+    assert inbox.iloc[0]["is_read"] == 0
+
+
+def test_message_only_visible_to_its_recipient(conn):
+    mailbox.send_internal_message(conn, "biologist1", "Sujet", "Corps")
+    assert mailbox.get_inbox(conn, "lab_tech1").empty
+
+
+def test_mark_as_read_updates_unread_count(conn):
+    mailbox.send_internal_message(conn, "biologist1", "Sujet", "Corps")
+    assert mailbox.count_unread(conn, "biologist1") == 1
+
+    message_id = mailbox.get_inbox(conn, "biologist1").iloc[0]["message_id"]
+    mailbox.mark_as_read(conn, int(message_id), "biologist1")
+    assert mailbox.count_unread(conn, "biologist1") == 0
+
+
+def test_get_message_blocks_cross_account_read(conn):
+    mailbox.send_internal_message(conn, "biologist1", "Sujet", "Corps")
+    message_id = int(mailbox.get_inbox(conn, "biologist1").iloc[0]["message_id"])
+
+    assert mailbox.get_message(conn, message_id, "biologist1") is not None
+    assert mailbox.get_message(conn, message_id, "lab_tech1") is None
+
+
+def test_attachment_roundtrip(conn):
+    mailbox.send_internal_message(
+        conn, "cro_arc", "Rapport", "Voir pièce jointe",
+        attachment_bytes=b"%PDF-fake-bytes", attachment_name="report.pdf",
+        attachment_mimetype="application/pdf",
+    )
+    message_id = int(mailbox.get_inbox(conn, "cro_arc").iloc[0]["message_id"])
+    msg = mailbox.get_message(conn, message_id, "cro_arc")
+    assert msg["attachment_name"] == "report.pdf"
+    assert msg["attachment_data"] == b"%PDF-fake-bytes"
+    assert msg["attachment_mimetype"] == "application/pdf"
+
+
+def test_message_without_attachment_has_none_fields(conn):
+    mailbox.send_internal_message(conn, "cro_arc", "Sujet", "Corps")
+    message_id = int(mailbox.get_inbox(conn, "cro_arc").iloc[0]["message_id"])
+    msg = mailbox.get_message(conn, message_id, "cro_arc")
+    assert msg["attachment_name"] is None
+    assert msg["attachment_data"] is None
+
+
+def test_fan_out_delivers_to_all_and_ignores_blanks(conn):
+    n = mailbox.send_internal_message_to_many(conn, ["lab_tech1", "  ", "cro_arc", ""], "Relance", "Corps")
+    assert n == 2
+    assert len(mailbox.get_inbox(conn, "lab_tech1")) == 1
+    assert len(mailbox.get_inbox(conn, "cro_arc")) == 1
+
+
+def test_fan_out_with_no_valid_recipients_sends_nothing(conn):
+    n = mailbox.send_internal_message_to_many(conn, ["", "  ", None], "Relance", "Corps")
+    assert n == 0
+
+
+def test_list_active_usernames_excludes_given_user(conn):
+    accounts = mailbox.list_active_usernames(conn, exclude_username="lab_tech1")
+    usernames = [u for u, _, _ in accounts]
+    assert "lab_tech1" not in usernames
+    assert "biologist1" in usernames
+
+
+def test_list_active_usernames_excludes_inactive_accounts(conn):
+    db.create_user(conn, "inactive_user", "Inactive", "PHYSICIAN", "i@example.com", "hash")
+    db.set_user_active(conn, "inactive_user", False)
+    accounts = mailbox.list_active_usernames(conn)
+    usernames = [u for u, _, _ in accounts]
+    assert "inactive_user" not in usernames
+
+
+def test_list_usernames_by_role(conn):
+    biologists = mailbox.list_usernames_by_role(conn, "BIOLOGIST")
+    assert biologists == ["biologist1"]
+    assert mailbox.list_usernames_by_role(conn, "SPONSOR") == ["sponsor_lph"]

@@ -1,0 +1,29 @@
+"""Vérifie que l'extraction VINC ne peut jamais exposer un résultat non
+validé biologiquement (risque n°1 de l'analyse de risques : export vers
+le promoteur de données pas encore signées par le biologiste)."""
+import pandas as pd
+
+from business_logic import filter_reviewed_only
+
+
+def test_filter_reviewed_only_keeps_only_reviewed_rows():
+    df = pd.DataFrame({
+        "usubjid": ["S1", "S2", "S3", "S4"],
+        "status": ["PENDING", "TECHNICAL_OK", "REVIEWED", "REVIEWED"],
+    })
+    out = filter_reviewed_only(df)
+    assert set(out["status"]) == {"REVIEWED"}
+    assert len(out) == 2
+    assert set(out["usubjid"]) == {"S3", "S4"}
+
+
+def test_filter_reviewed_only_empty_dataframe_is_noop():
+    df = pd.DataFrame(columns=["usubjid", "status"])
+    out = filter_reviewed_only(df)
+    assert out.empty
+
+
+def test_filter_reviewed_only_missing_status_column_returns_unchanged():
+    df = pd.DataFrame({"usubjid": ["S1", "S2"]})
+    out = filter_reviewed_only(df)
+    assert len(out) == 2

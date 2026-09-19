@@ -171,3 +171,40 @@ def render_status_stepper(status: str) -> str:
             items.append(f'<div style="flex:0.6;height:2px;background:{line_color};margin-top:11px;"></div>')
 
     return f'<div style="display:flex;align-items:flex-start;width:100%;margin:0.4rem 0 0.8rem 0;">{"".join(items)}</div>'
+
+
+def render_storage_map_html(storage_df) -> str:
+    """Carte de stockage : une carte par congélateur, listant ses racks
+    avec le nombre d'échantillons par boîte. Reçoit directement le
+    DataFrame de db.get_all_current_storage_locations (pas d'accès DB
+    ici, pour rester testable sans base)."""
+    if storage_df.empty:
+        return '<div class="lims-panel"><p style="color:#7B8794;">Aucun échantillon rangé pour le moment.</p></div>'
+
+    cards = []
+    for freezer_id, freezer_group in storage_df.groupby("freezer_id"):
+        rack_blocks = []
+        for rack_id, rack_group in freezer_group.groupby("rack_id"):
+            box_chips = []
+            for box_id, box_group in rack_group.groupby("box_id"):
+                n = len(box_group)
+                # Couleur indicative de densité (purement visuelle, pas de seuil métier réel)
+                color = "#B03A2E" if n >= 8 else ("#B9770E" if n >= 4 else "#2E86C1")
+                box_chips.append(
+                    f'<span style="display:inline-block;margin:2px;padding:4px 10px;'
+                    f'border-radius:6px;background:{color}1A;color:{color};'
+                    f'font-size:0.78rem;font-weight:600;border:1px solid {color}55;">'
+                    f'📦 {box_id} · {n}</span>'
+                )
+            rack_blocks.append(
+                f'<div style="margin-bottom:0.5rem;"><strong style="font-size:0.85rem;">Rack {rack_id}</strong><br/>'
+                f'{"".join(box_chips)}</div>'
+            )
+        total = len(freezer_group)
+        cards.append(f"""
+        <div class="lims-panel" style="margin-bottom:1rem;">
+            <h4>🧊 {freezer_id} <span style="font-weight:400;color:#7B8794;font-size:0.8rem;">— {total} échantillon(s)</span></h4>
+            {"".join(rack_blocks)}
+        </div>
+        """)
+    return "".join(cards)

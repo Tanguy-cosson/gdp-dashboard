@@ -138,14 +138,29 @@ def run_migrations(conn):
     """Applique chaque migration (elles sont idempotentes en interne :
     rejouer une migration déjà appliquée ne fait rien, grâce à
     l'introspection). schema_version est mis à jour après coup, à titre
-    de trace uniquement — il ne conditionne jamais l'exécution."""
+    de trace uniquement — il ne conditionne jamais l'exécution.
+
+    IMPORTANT — ordre d'exécution : la migration 4 (AUDIT_TRAIL.record_ref)
+    doit TOUJOURS s'exécuter en premier, avant toute autre migration,
+    quel que soit son numéro. Raison : chaque migration se termine par
+    un appel à log_audit(), qui écrit désormais dans record_ref. Sur une
+    base vraiment ancienne qui n'a ni les colonnes USERS ni record_ref,
+    exécuter la migration 1 en premier ferait planter son propre
+    log_audit() final sur une colonne qui n'existe pas encore — un
+    problème d'œuf et de poule découvert grâce aux tests (voir
+    tests/test_migrations.py)."""
+    was_missing_4 = not _column_exists(conn, "AUDIT_TRAIL", "record_ref")
+    _migration_4_audit_record_ref(conn)
+
     checks = {
         1: lambda: not _column_exists(conn, "USERS", "active"),
         2: lambda: not _column_exists(conn, "PATIENTS", "anonymized"),
         3: lambda: not _column_exists(conn, "USERS", "job_title"),
-        4: lambda: not _column_exists(conn, "AUDIT_TRAIL", "record_ref"),
     }
     for version, name, migration_fn in MIGRATIONS:
+        if version == 4:
+            continue  # déjà appliquée ci-dessus, avant tout le reste
+
         was_missing = checks.get(version, lambda: True)()
 
         migration_fn(conn)
@@ -154,3 +169,7 @@ def run_migrations(conn):
             log_audit(conn, "SCHEMA", "MIGRATION_APPLIED", "system", comment=f"v{version}: {name}")
 
         set_setting(conn, "schema_version", str(version))
+
+    if was_missing_4:
+        log_audit(conn, "SCHEMA", "MIGRATION_APPLIED", "system", comment="v4: audit_record_ref")
+    set_setting(conn, "schema_version", "4")

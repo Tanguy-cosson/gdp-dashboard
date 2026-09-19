@@ -5,6 +5,17 @@ import pandas as pd
 from constants import CRITICAL_FLAG, NORMAL_FLAG, OOR_FLAG
 
 
+def filter_reviewed_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Ne conserve que les résultats ayant franchi la validation biologique
+    (status == 'REVIEWED'). Utilisé avant toute transmission externe
+    (extraction VINC vers le CRO/promoteur) : un résultat encore PENDING
+    ou TECHNICAL_OK n'a pas de valeur probante et ne doit jamais quitter
+    le laboratoire (cf. analyse de risques, risque n°1)."""
+    if df.empty or "status" not in df.columns:
+        return df
+    return df[df["status"] == "REVIEWED"].copy()
+
+
 def compute_oor_flag(df: pd.DataFrame) -> pd.DataFrame:
     """Ajoute une colonne 'Alerte'. Une valeur CRITIQUE (panic value)
     prime toujours sur une simple alerte hors-norme."""

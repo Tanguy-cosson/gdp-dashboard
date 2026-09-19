@@ -1,0 +1,101 @@
+"""Tests de migrations.py — chaque migration est rejouée à partir d'un
+état de base MINIMAL reproduisant le schéma d'origine (avant toute
+migration), pour prouver que la chaîne complète rattrape le retard
+sans perdre de données existantes. run_migrations() exécute TOUJOURS
+les 4 migrations dans l'ordre, donc chaque scénario de test doit
+contenir les tables de base que la vraie application aurait déjà
+(USERS, PATIENTS, AUDIT_TRAIL, SETTINGS) — seules les colonnes/tables
+plus récentes sont volontairement absentes."""
+import sqlite3
+
+from migrations import _column_exists, _table_exists, run_migrations
+
+_LEGACY_V0_SCHEMA = """
+    CREATE TABLE USERS (
+        username TEXT PRIMARY KEY, full_name TEXT NOT NULL, role TEXT NOT NULL,
+        password_hash TEXT NOT NULL, email TEXT
+    );
+    CREATE TABLE PATIENTS (
+        patient_id TEXT PRIMARY KEY, usubjid TEXT NOT NULL UNIQUE, site_id TEXT NOT NULL,
+        subjid TEXT NOT NULL, sex TEXT, birth_year INTEGER
+    );
+    CREATE TABLE AUDIT_TRAIL (
+        audit_id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL,
+        action TEXT NOT NULL, user_name TEXT NOT NULL,
+        event_timestamp TEXT DEFAULT (datetime('now')), comment TEXT
+    );
+    CREATE TABLE SETTINGS (setting_key TEXT PRIMARY KEY, setting_value TEXT);
+    INSERT INTO USERS VALUES ('lab_tech1', 'Technicien', 'LAB_TECH', 'hash', 'a@a.com');
+    INSERT INTO PATIENTS VALUES ('P-1', 'U-1', 'FR-001', '1', 'M', 1980);
+"""
+
+
+def _legacy_connection():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.executescript(_LEGACY_V0_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def test_migration_1_adds_user_management_columns():
+    conn = _legacy_connection()
+    run_migrations(conn)
+
+    for col in ["active", "failed_login_count", "locked_until", "must_change_password", "created_at"]:
+        assert _column_exists(conn, "USERS", col), f"colonne manquante après migration : {col}"
+    assert _table_exists(conn, "PASSWORD_RESET_TOKENS")
+    assert conn.execute("SELECT username FROM USERS WHERE username='lab_tech1'").fetchone() is not None
+
+
+def test_migration_2_adds_gdpr_columns():
+    conn = _legacy_connection()
+    run_migrations(conn)
+
+    assert _column_exists(conn, "PATIENTS", "anonymized")
+    assert _column_exists(conn, "PATIENTS", "anonymized_at")
+    assert _table_exists(conn, "CONSENT")
+    assert conn.execute("SELECT usubjid FROM PATIENTS WHERE patient_id='P-1'").fetchone()[0] == "U-1"
+
+
+def test_migration_3_adds_mailbox_and_job_title():
+    conn = _legacy_connection()
+    run_migrations(conn)
+
+    assert _column_exists(conn, "USERS", "job_title")
+    assert _table_exists(conn, "MESSAGES")
+
+
+def test_migration_4_adds_audit_record_ref_reproduces_the_production_bug():
+    """Reproduit exactement le scénario qui a fait planter l'application
+    en production : AUDIT_TRAIL sans la colonne record_ref, alors que
+    audit.log_audit() l'utilise déjà."""
+    conn = _legacy_connection()
+    assert not _column_exists(conn, "AUDIT_TRAIL", "record_ref")  # confirme le point de départ
+
+    run_migrations(conn)
+
+    assert _column_exists(conn, "AUDIT_TRAIL", "record_ref")
+
+    from audit import log_audit
+    log_audit(conn, "USERS", "LOGIN_SUCCESS", "lab_tech1", record_ref="something")
+    row = conn.execute("SELECT record_ref FROM AUDIT_TRAIL WHERE action='LOGIN_SUCCESS'").fetchone()
+    assert row[0] == "something"
+
+
+def test_migrations_are_idempotent(conn):
+    """La fixture `conn` (voir conftest.py) a déjà toutes les migrations
+    appliquées une fois au démarrage. Les rejouer ne doit rien changer
+    ni planter — condition indispensable puisque run_migrations()
+    s'exécute à CHAQUE démarrage de l'application."""
+    audit_count_before = conn.execute(
+        "SELECT COUNT(*) FROM AUDIT_TRAIL WHERE action='MIGRATION_APPLIED'"
+    ).fetchone()[0]
+
+    run_migrations(conn)
+    run_migrations(conn)
+
+    audit_count_after = conn.execute(
+        "SELECT COUNT(*) FROM AUDIT_TRAIL WHERE action='MIGRATION_APPLIED'"
+    ).fetchone()[0]
+    assert audit_count_after == audit_count_before

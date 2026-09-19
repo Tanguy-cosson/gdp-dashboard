@@ -195,6 +195,47 @@ def get_current_storage_location(conn, sample_id):
     return dict(zip(keys, row))
 
 
+def get_all_current_storage_locations(conn):
+    """Position ACTUELLE (la plus récente) de chaque échantillon
+    stocké au moins une fois — un échantillon déplacé plusieurs fois a
+    plusieurs lignes dans STORAGE_LOCATIONS, on ne garde que la
+    dernière par sample_id."""
+    return pd.read_sql_query(
+        """
+        SELECT sl.sample_id, sl.freezer_id, sl.rack_id, sl.box_id, sl.position_well,
+               sl.volume_ul, sl.moved_at, sa.sample_type, p.usubjid
+        FROM STORAGE_LOCATIONS sl
+        JOIN (
+            SELECT sample_id, MAX(moved_at) AS latest
+            FROM STORAGE_LOCATIONS
+            GROUP BY sample_id
+        ) latest_per_sample
+          ON sl.sample_id = latest_per_sample.sample_id AND sl.moved_at = latest_per_sample.latest
+        JOIN SAMPLES sa ON sl.sample_id = sa.sample_id
+        JOIN PATIENTS p ON sa.patient_id = p.patient_id
+        ORDER BY sl.freezer_id, sl.rack_id, sl.box_id, sl.position_well
+        """,
+        conn,
+    )
+
+
+def get_samples_without_storage(conn):
+    """Échantillons reçus mais jamais rangés physiquement (aucune ligne
+    dans STORAGE_LOCATIONS) — utile pour repérer ce qui traîne sur la
+    paillasse plutôt qu'au congélateur."""
+    return pd.read_sql_query(
+        """
+        SELECT sa.sample_id, sa.sample_type, sa.receipt_datetime, p.usubjid, v.visit_code
+        FROM SAMPLES sa
+        JOIN PATIENTS p ON sa.patient_id = p.patient_id
+        JOIN VISITES v ON sa.visit_id = v.visit_id
+        WHERE sa.sample_id NOT IN (SELECT DISTINCT sample_id FROM STORAGE_LOCATIONS)
+        ORDER BY sa.receipt_datetime DESC
+        """,
+        conn,
+    )
+
+
 # ---------------------------------------------------------------------
 # LAB_RESULTS
 # ---------------------------------------------------------------------

@@ -9,13 +9,13 @@ ROLE_LABELS = {
 }
 
 PAGE_PERMISSIONS = {
-    "LAB_TECH": ["Data Ingestion", "HL7 Import", "Sample Labels", "Sample Scan", "Technical Validation",
-                 "Process Flow", "Messagerie", "Mon Compte", "Guide"],
+    "LAB_TECH": ["Data Ingestion", "HL7 Import", "Sample Labels", "Sample Scan", "Storage Map",
+                 "Technical Validation", "Process Flow", "Messagerie", "Mon Compte", "Guide"],
     "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes",
                   "Process Flow", "Messagerie", "Mon Compte", "Guide"],
     "PHYSICIAN": ["Patient Records", "Notes", "Messagerie", "Mon Compte", "Guide"],
     "CRO": ["Dashboard", "Process Flow", "Patient Search", "Patient follow-up", "Sample Labels",
-            "Sample Scan", "Technical Validation", "Biological Validation",
+            "Sample Scan", "Storage Map", "Technical Validation", "Biological Validation",
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
             "Data Privacy", "Messagerie", "Mon Compte", "Settings", "Automation",
             "User Management", "Audit Trail", "Guide"],
@@ -55,7 +55,7 @@ SIGNATURE_REASONS = [
 # ---------------------------------------------------------------------
 PAGE_ICONS = {
     "Data Ingestion": "📥", "HL7 Import": "🔌", "Sample Labels": "🏷️",
-    "Sample Scan": "📷", "Process Flow": "🧭", "Technical Validation": "🧪",
+    "Sample Scan": "📷", "Storage Map": "🧊", "Process Flow": "🧭", "Technical Validation": "🧪",
     "Biological Validation": "🧬", "Dashboard": "📊", "Patient Search": "🔍",
     "Patient follow-up": "📋", "Patient Records": "👤", "VINC extraction": "📤",
     "Notes": "📝", "Export CDISC SDTM": "📦", "Data Privacy": "🔒",

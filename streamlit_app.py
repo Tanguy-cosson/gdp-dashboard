@@ -12,26 +12,27 @@ from automation import check_and_send_reminders, preview_automation, send_secure
 from barcode_utils import (decode_barcode_from_image, generate_barcode_png,
                             generate_sample_label_pdf, zbar_available)
 from business_logic import (build_patients_matrix, compute_oor_flag, compute_tat_hours,
-                             validate_ingestion_dataframe)
+                             filter_reviewed_only, validate_ingestion_dataframe)
 from cdisc_export import generate_define_xml, generate_dm_domain
 from constants import (ALL_ROLES, CRITICAL_FLAG, ESIGNATURE_LEGAL_NOTICE, NORMAL_FLAG,
                         OOR_FLAG, PAGE_ICONS, PAGE_PERMISSIONS, ROLE_LABELS,
                         SIGNATURE_REASONS, STUDYID)
 from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_status,
-                create_user, find_sample_by_barcode, get_connection,
-                get_current_storage_location, get_or_create_patient, get_or_create_sample,
-                get_or_create_site, get_or_create_visit, get_samples_pending_labels,
-                get_setting, get_usubjids_for_results, insert_lab_result, insert_remark,
-                list_users, mark_biological_validation, mark_labels_printed,
-                mark_technical_validation, read_audit_trail, read_full_results,
-                read_remarks, set_setting, set_user_active, set_user_role, username_exists)
+                create_user, find_sample_by_barcode, get_all_current_storage_locations,
+                get_connection, get_current_storage_location, get_or_create_patient,
+                get_or_create_sample, get_or_create_site, get_or_create_visit,
+                get_samples_pending_labels, get_samples_without_storage, get_setting,
+                get_usubjids_for_results, insert_lab_result, insert_remark, list_users,
+                mark_biological_validation, mark_labels_printed, mark_technical_validation,
+                read_audit_trail, read_full_results, read_remarks, set_setting,
+                set_user_active, set_user_role, username_exists)
 from gdpr import anonymize_patient, export_patient_data, get_all_consent, record_consent
 from hl7_import import parse_oru_r01, parse_ref_range
 from mailbox import (count_unread, get_inbox, get_message, list_active_usernames,
                       mark_as_read, send_internal_message, send_internal_message_to_many)
 from pdf_reports import generate_patient_pdf_report, generate_vinc_pdf_report
 from ui import _html, inject_custom_css, kpi_card, render_landing_page, render_top_banner
-from workflow_viz import render_pipeline_svg, render_status_stepper
+from workflow_viz import render_pipeline_svg, render_status_stepper, render_storage_map_html
 
 st.set_page_config(page_title="Projet BLOOD", page_icon="🩸", layout="wide")
 
@@ -304,6 +305,29 @@ def page_sample_scan(conn, user_name):
                     st.rerun()
 
     log_audit(conn, "SAMPLES", "SAMPLE_SCANNED", user_name, record_ref=sample_id)
+
+
+def page_storage_map(conn):
+    """Vue d'ensemble visuelle de la chaîne de conservation : où sont
+    physiquement rangés les échantillons, et lesquels ne le sont pas
+    encore (repose sur la table STORAGE_LOCATIONS, alimentée depuis
+    Sample Scan)."""
+    st.title("🧊 STORAGE MAP")
+    st.caption("Répartition des échantillons par congélateur / rack / boîte, "
+                "et détection de ceux jamais rangés physiquement.")
+
+    storage_df = get_all_current_storage_locations(conn)
+    st.markdown(render_storage_map_html(storage_df), unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("⚠️ Échantillons jamais rangés")
+    missing_df = get_samples_without_storage(conn)
+    if missing_df.empty:
+        st.success("✅ Tous les échantillons reçus ont une position de stockage enregistrée.")
+    else:
+        st.warning(f"{len(missing_df)} échantillon(s) reçu(s) mais jamais rangé(s) physiquement "
+                    "(assignez une position depuis la page Sample Scan).")
+        st.dataframe(missing_df, use_container_width=True)
 
 
 def page_technical_validation(conn, user_name):
@@ -1333,9 +1357,20 @@ def page_extraction_vinc(conn, user_name, role):
     st.title("RESULTS OF THE VINC VISIT")
     render_sponsor_reminder(conn)
     df = read_full_results(conn)
-    vinc_df = df[df["visit_code"] == "VINC"]
-    if vinc_df.empty:
+    vinc_df_all = df[df["visit_code"] == "VINC"]
+    if vinc_df_all.empty:
         st.info("No VINC results are available at present.")
+        return
+
+    vinc_df = filter_reviewed_only(vinc_df_all)
+    n_excluded = len(vinc_df_all) - len(vinc_df)
+    if n_excluded > 0:
+        st.warning(f"⚠️ {n_excluded} VINC result(s) are not yet biologically validated "
+                   "(status PENDING or TECHNICAL_OK) and have been excluded from this "
+                   "extract. Contact the biologist to finalize validation before the "
+                   "monthly export — see risk #1 of the risk analysis.")
+    if vinc_df.empty:
+        st.info("No biologically validated (REVIEWED) VINC results are available yet.")
         return
 
     vinc_df = compute_oor_flag(vinc_df)
@@ -1445,6 +1480,8 @@ def main():
         page_sample_labels(conn, username)
     elif page == "Sample Scan":
         page_sample_scan(conn, username)
+    elif page == "Storage Map":
+        page_storage_map(conn)
     elif page == "Technical Validation":
         page_technical_validation(conn, username)
     elif page == "Biological Validation":

@@ -1,0 +1,180 @@
+"""Tests de db.py — couche base de données. Chaque test reçoit une
+base SQLite fraîche en mémoire via la fixture `conn` (voir conftest.py),
+donc aucun test ne peut être pollué par un autre."""
+import db
+
+
+# ---------------------------------------------------------------------
+# Sites / patients / visites / échantillons
+# ---------------------------------------------------------------------
+def test_get_or_create_site_is_idempotent(conn):
+    site_id_1 = db.get_or_create_site(conn, "FR-001", "Hopital Test", "FR")
+    site_id_2 = db.get_or_create_site(conn, "FR-001", "Nom different", "BE")
+    assert site_id_1 == site_id_2 == "FR-001"
+    # La deuxième création n'a pas dû écraser le nom/pays d'origine
+    row = conn.execute("SELECT site_name, country FROM SITES WHERE site_id = 'FR-001'").fetchone()
+    assert row == ("Hopital Test", "FR")
+
+
+def test_get_or_create_patient_and_visit(conn):
+    db.get_or_create_site(conn, "FR-001")
+    patient_id = db.get_or_create_patient(conn, "P-1", "U-1", "FR-001", "001", "M", 1980)
+    visit_id = db.get_or_create_visit(conn, patient_id, "V1", "2026-01-01", 2)
+    visit_id_again = db.get_or_create_visit(conn, patient_id, "V1", "2026-01-01", 2)
+    assert visit_id == visit_id_again  # pas de doublon pour la même visite
+
+
+def test_get_or_create_sample_assigns_barcode(conn):
+    db.get_or_create_site(conn, "FR-001")
+    patient_id = db.get_or_create_patient(conn, "P-1", "U-1", "FR-001", "001", "M", 1980)
+    visit_id = db.get_or_create_visit(conn, patient_id, "V1", "2026-01-01", 2)
+    sample_id = db.get_or_create_sample(conn, patient_id, visit_id, "SERUM")
+
+    row = conn.execute("SELECT barcode_value FROM SAMPLES WHERE sample_id = ?", (sample_id,)).fetchone()
+    assert row[0] == sample_id  # le code-barres = l'identifiant échantillon par défaut
+
+
+def test_get_or_create_sample_one_per_patient_visit_type(conn):
+    db.get_or_create_site(conn, "FR-001")
+    patient_id = db.get_or_create_patient(conn, "P-1", "U-1", "FR-001", "001", "M", 1980)
+    visit_id = db.get_or_create_visit(conn, patient_id, "V1", "2026-01-01", 2)
+    s1 = db.get_or_create_sample(conn, patient_id, visit_id, "SERUM")
+    s2 = db.get_or_create_sample(conn, patient_id, visit_id, "SERUM")
+    s3 = db.get_or_create_sample(conn, patient_id, visit_id, "WHOLE_BLOOD")
+    assert s1 == s2  # même patient/visite/type -> même échantillon
+    assert s1 != s3  # type différent -> échantillon différent
+
+
+def test_find_sample_by_barcode(conn):
+    db.get_or_create_site(conn, "FR-001")
+    patient_id = db.get_or_create_patient(conn, "P-1", "U-1", "FR-001", "001", "M", 1980)
+    visit_id = db.get_or_create_visit(conn, patient_id, "V1", "2026-01-01", 2)
+    sample_id = db.get_or_create_sample(conn, patient_id, visit_id, "SERUM")
+
+    assert db.find_sample_by_barcode(conn, sample_id) == sample_id
+    assert db.find_sample_by_barcode(conn, "  " + sample_id + "  ") == sample_id  # espaces tolérés
+    assert db.find_sample_by_barcode(conn, "UNKNOWN-BARCODE") is None
+
+
+# ---------------------------------------------------------------------
+# Résultats & workflow de validation
+# ---------------------------------------------------------------------
+def _seed_one_result(conn, value=5.0, ref_low=4.0, ref_high=6.0):
+    db.get_or_create_site(conn, "FR-001")
+    patient_id = db.get_or_create_patient(conn, "P-1", "U-1", "FR-001", "001", "M", 1980)
+    visit_id = db.get_or_create_visit(conn, patient_id, "V1", "2026-01-01", 2)
+    sample_id = db.get_or_create_sample(conn, patient_id, visit_id, "SERUM")
+    db.insert_lab_result(conn, visit_id, "GLUC", "Glucose", value, "mmol/L",
+                          "2026-01-01", ref_low, ref_high, sample_id)
+    return conn.execute("SELECT result_id FROM LAB_RESULTS").fetchone()[0]
+
+
+def test_mark_technical_validation_only_affects_pending(conn):
+    result_id = _seed_one_result(conn)
+    n = db.mark_technical_validation(conn, [result_id], "lab_tech1")
+    assert n == 1
+    status = conn.execute("SELECT status FROM LAB_RESULTS WHERE result_id = ?", (result_id,)).fetchone()[0]
+    assert status == "TECHNICAL_OK"
+
+    # Rejouer sur un résultat déjà TECHNICAL_OK ne doit rien faire (garde WHERE status='PENDING')
+    n2 = db.mark_technical_validation(conn, [result_id], "lab_tech1")
+    assert n2 == 1  # la fonction renvoie len(result_ids) même si 0 ligne réellement modifiée
+    status_after = conn.execute("SELECT status FROM LAB_RESULTS WHERE result_id = ?", (result_id,)).fetchone()[0]
+    assert status_after == "TECHNICAL_OK"  # toujours TECHNICAL_OK, pas repassé par une autre valeur
+
+
+def test_mark_biological_validation_only_affects_technical_ok(conn):
+    result_id = _seed_one_result(conn)
+    # Sans passage par la validation technique, la validation biologique ne doit rien faire
+    db.mark_biological_validation(conn, [result_id], "biologist1", "Reviewed and approved")
+    status = conn.execute("SELECT status FROM LAB_RESULTS WHERE result_id = ?", (result_id,)).fetchone()[0]
+    assert status == "PENDING"
+
+    db.mark_technical_validation(conn, [result_id], "lab_tech1")
+    db.mark_biological_validation(conn, [result_id], "biologist1", "Reviewed and approved", "RAS")
+    row = conn.execute(
+        "SELECT status, biologist_validated_by, signature_reason, remarks FROM LAB_RESULTS WHERE result_id = ?",
+        (result_id,),
+    ).fetchone()
+    assert row == ("REVIEWED", "biologist1", "Reviewed and approved", "RAS")
+
+
+def test_get_usubjids_for_results(conn):
+    result_id = _seed_one_result(conn)
+    usubjids = db.get_usubjids_for_results(conn, [result_id])
+    assert usubjids == ["U-1"]
+    assert db.get_usubjids_for_results(conn, []) == []
+
+
+# ---------------------------------------------------------------------
+# Sécurité des comptes
+# ---------------------------------------------------------------------
+def test_record_login_failure_locks_after_threshold(conn):
+    from constants import LOGIN_LOCKOUT_MINUTES, LOGIN_LOCKOUT_THRESHOLD
+    db.create_user(conn, "newuser", "New User", "PHYSICIAN", "n@example.com", "fakehash")
+
+    locked = False
+    for _ in range(LOGIN_LOCKOUT_THRESHOLD):
+        locked = db.record_login_failure(conn, "newuser", LOGIN_LOCKOUT_THRESHOLD, LOGIN_LOCKOUT_MINUTES)
+    assert locked is True
+
+    row = conn.execute("SELECT locked_until, failed_login_count FROM USERS WHERE username = ?",
+                        ("newuser",)).fetchone()
+    assert row[0] is not None
+    assert row[1] == LOGIN_LOCKOUT_THRESHOLD
+
+
+def test_record_login_success_resets_lockout(conn):
+    from constants import LOGIN_LOCKOUT_MINUTES, LOGIN_LOCKOUT_THRESHOLD
+    db.create_user(conn, "newuser", "New User", "PHYSICIAN", "n@example.com", "fakehash")
+    db.record_login_failure(conn, "newuser", LOGIN_LOCKOUT_THRESHOLD, LOGIN_LOCKOUT_MINUTES)
+    db.record_login_success(conn, "newuser")
+
+    row = conn.execute("SELECT locked_until, failed_login_count FROM USERS WHERE username = ?",
+                        ("newuser",)).fetchone()
+    assert row == (None, 0)
+
+
+def test_create_user_defaults_to_must_change_password(conn):
+    db.create_user(conn, "newuser", "New User", "PHYSICIAN", "n@example.com", "fakehash")
+    row = conn.execute("SELECT active, must_change_password FROM USERS WHERE username = ?",
+                        ("newuser",)).fetchone()
+    assert row == (1, 1)
+
+
+def test_username_exists(conn):
+    assert db.username_exists(conn, "lab_tech1") is True  # compte de démo créé par schema.sql
+    assert db.username_exists(conn, "does_not_exist") is False
+
+
+def test_set_user_active_and_role(conn):
+    db.create_user(conn, "newuser", "New User", "PHYSICIAN", "n@example.com", "fakehash")
+    db.set_user_active(conn, "newuser", False)
+    assert conn.execute("SELECT active FROM USERS WHERE username='newuser'").fetchone()[0] == 0
+
+    db.set_user_role(conn, "newuser", "CRO")
+    assert conn.execute("SELECT role FROM USERS WHERE username='newuser'").fetchone()[0] == "CRO"
+
+
+# ---------------------------------------------------------------------
+# Réinitialisation de mot de passe par jeton
+# ---------------------------------------------------------------------
+def test_password_reset_token_roundtrip(conn):
+    db.create_user(conn, "newuser", "New User", "PHYSICIAN", "n@example.com", "fakehash")
+    db.create_password_reset_token(conn, "newuser", "tok123", expires_minutes=60)
+
+    username = db.consume_password_reset_token(conn, "tok123")
+    assert username == "newuser"
+
+    # Un jeton déjà consommé ne doit plus fonctionner
+    assert db.consume_password_reset_token(conn, "tok123") is None
+
+
+def test_password_reset_token_expired(conn):
+    db.create_user(conn, "newuser", "New User", "PHYSICIAN", "n@example.com", "fakehash")
+    conn.execute(
+        "INSERT INTO PASSWORD_RESET_TOKENS (token, username, expires_at) VALUES (?, ?, ?)",
+        ("expired_tok", "newuser", "2000-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    assert db.consume_password_reset_token(conn, "expired_tok") is None
