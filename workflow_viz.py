@@ -2,7 +2,7 @@
 workflow_viz.py — Représentations visuelles du workflow, en s'inspirant
 des diagrammes de pipeline de laboratoire (Start -> étapes -> End,
 avec embranchement de décision) : un schéma d'ensemble avec les
-compteurs en direct, et une frise par patient/échantillon montrant où
+compteurs en direct, et une timeline by patient/sample montrant où
 il en est précisément.
 
 Tout est généré en SVG pur (pas de dépendance graphviz/matplotlib
@@ -76,7 +76,7 @@ def render_pipeline_svg(conn) -> str:
         flagged = compute_oor_flag(df)
         n_critical = int(((flagged["Alerte"] == CRITICAL_FLAG) & (flagged["status"] != "REVIEWED")).sum())
 
-    W, H = 720, 760
+    W, H = 900, 760
     svg = [f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">']
     svg.append("""<defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -92,11 +92,11 @@ def render_pipeline_svg(conn) -> str:
     svg.append(_arrow(cx, 54, cx, 84))
 
     # Ingestion
-    svg.append(_box(cx - box_w/2, 84, box_w, box_h, "Ingestion (CSV / HL7)", f"{n_total} résultat(s) au total", *_COLOR_BOX))
+    svg.append(_box(cx - box_w/2, 84, box_w, box_h, "Ingestion (CSV / HL7)", f"{n_total} total result(s)", *_COLOR_BOX))
     svg.append(_arrow(cx, 134, cx, 164))
 
     # Sample creation
-    svg.append(_box(cx - box_w/2, 164, box_w, box_h, "Échantillon créé + code-barres", "chaîne de conservation", *_COLOR_BOX))
+    svg.append(_box(cx - box_w/2, 164, box_w, box_h, "Sample created + barcode", "chain of custody", *_COLOR_BOX))
     svg.append(_arrow(cx, 214, cx, 244))
 
     # Technical validation
@@ -108,24 +108,24 @@ def render_pipeline_svg(conn) -> str:
     svg.append(_arrow(cx, 374, cx, 404))
 
     # Decision diamond: critical value?
-    svg.append(_diamond(cx, 430, 220, 60, "Valeur critique détectée ?"))
+    svg.append(_diamond(cx, 430, 220, 60, "Critical value detected?"))
     # Yes branch -> alert box (side)
     alert_x, alert_y = cx + 170, 405
     svg.append(_arrow(cx + 60, 425, alert_x, alert_y + 25, label="Oui"))
-    svg.append(_box(alert_x, alert_y, 220, 50, "🔴 Alerte immédiate", f"{n_critical} en cours", *_COLOR_ALERT))
+    svg.append(_box(alert_x, alert_y, 220, 50, "🔴 Immediate alert", f"{n_critical} pending", *_COLOR_ALERT))
     svg.append(_arrow(alert_x + 110, alert_y + 50, cx + 20, 480, dash=True))
     # No branch -> straight down
     svg.append(_arrow(cx, 460, cx, 490, label="Non"))
 
     # Reviewed / reporting stage
-    svg.append(_box(cx - box_w/2, 490, box_w, box_h, "Résultats validés", f"{n_reviewed} disponibles", *_COLOR_REPORT))
+    svg.append(_box(cx - box_w/2, 490, box_w, box_h, "Reviewed results", f"{n_reviewed} available", *_COLOR_REPORT))
     svg.append(_arrow(cx, 540, cx, 570))
 
     # Branch to 3 outputs
     out_y = 570
     out_w = 200
     positions = [cx - 250, cx - 10, cx + 230]
-    labels = [("Dossier patient", "rapport PDF"), ("Export VINC", "CRO / Sponsor"), ("Export SDTM", "LB + DM + define.xml")]
+    labels = [("Dossier patient", "PDF report"), ("VINC export", "CRO / Sponsor"), ("SDTM export", "LB + DM + define.xml")]
     for px, (lab, sub) in zip(positions, labels):
         svg.append(_arrow(cx, 570, px + out_w/2 - 40, out_y, dash=False))
         svg.append(_box(px, out_y, out_w, 50, lab, sub, *_COLOR_BOX))
@@ -139,9 +139,9 @@ def render_pipeline_svg(conn) -> str:
 
 
 _STEPPER_STAGES = [
-    ("PENDING", "Ingéré"),
-    ("TECHNICAL_OK", "Validé technique"),
-    ("REVIEWED", "Validé biologique"),
+    ("PENDING", "Ingested"),
+    ("TECHNICAL_OK", "Technically validated"),
+    ("REVIEWED", "Biologically reviewed"),
 ]
 
 
@@ -179,7 +179,7 @@ def render_storage_map_html(storage_df) -> str:
     DataFrame de db.get_all_current_storage_locations (pas d'accès DB
     ici, pour rester testable sans base)."""
     if storage_df.empty:
-        return '<div class="lims-panel"><p style="color:#7B8794;">Aucun échantillon rangé pour le moment.</p></div>'
+        return '<div class="lims-panel"><p style="color:#7B8794;">No sample has been stored yet.</p></div>'
 
     cards = []
     for freezer_id, freezer_group in storage_df.groupby("freezer_id"):
@@ -203,7 +203,7 @@ def render_storage_map_html(storage_df) -> str:
         total = len(freezer_group)
         cards.append(f"""
         <div class="lims-panel" style="margin-bottom:1rem;">
-            <h4>🧊 {freezer_id} <span style="font-weight:400;color:#7B8794;font-size:0.8rem;">— {total} échantillon(s)</span></h4>
+            <h4>🧊 {freezer_id} <span style="font-weight:400;color:#7B8794;font-size:0.8rem;">— {total} sample(s)</span></h4>
             {"".join(rack_blocks)}
         </div>
         """)

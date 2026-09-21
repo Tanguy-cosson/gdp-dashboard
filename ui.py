@@ -62,8 +62,17 @@ def load_image_base64(relative_path):
 def inject_custom_css():
     st.markdown("""
     <style>
-    .block-container { padding-top: 1.2rem !important; }
-    body { overflow-x: hidden; }
+    [data-testid="stMainBlockContainer"] {
+    padding-top: 0.8rem !important;
+}
+
+.block-container {
+    padding-top: 0 !important;
+}
+
+body {
+    overflow-x: hidden;
+}
     [data-testid="stSidebar"] { background: #123C5A; border-right: 1px solid #0D2C42; }
     [data-testid="stSidebar"] * { color: #FFFFFF !important; }
     [data-testid="stSidebar"] [data-baseweb="input"] {
@@ -119,11 +128,14 @@ def inject_custom_css():
     .hero-banner {
         position: relative; overflow: hidden;
         background: linear-gradient(135deg, #123C5A 0%, #1B6EA5 100%);
-        border-radius: 0 10px 10px 0; padding: 2.2rem 3rem 2.2rem 2rem;
-        margin-left: -1rem; margin-right: -1rem; margin-top: -1.2rem; margin-bottom: 1.8rem;
-        width: calc(100% + 2rem); min-height: 130px; box-sizing: border-box;
+        border-radius: 0 10px 10px 0; padding: 1.6rem 2.5rem 1.6rem 1.8rem;
+        margin-left: -1rem;
+        margin-right: -1rem;
+        margin-top: -0.8rem;
+        margin-bottom: 1.4rem;
+        width: calc(100% + 2rem); min-height: 110px; box-sizing: border-box;
     }
-    .hero-banner h1 { color: #FFFFFF; font-size: 2.1rem; font-weight: 800; margin: 0 0 0.2rem 0; }
+    .hero-banner h1 { color: #FFFFFF; font-size: 1.9rem; font-weight: 800; margin: 0 0 0.2rem 0; }
     .hero-banner p { color: #DCEBF7; font-size: 1rem; margin: 0; position: relative; z-index: 2; }
     .hero-network {
         position: absolute; top: -10px; right: -10px; width: 52%; height: 180%;
@@ -250,7 +262,7 @@ def render_landing_page(conn):
 
     def img_tag(b64):
         if b64 is None:
-            return '<div style="font-size:0.75rem; color:#999;">logo manquant</div>'
+            return '<div style="font-size:0.75rem; color:#999;">logo missing</div>'
         return f'<img src="data:image/png;base64,{b64}">'
 
     st.markdown(_html(f"""
@@ -284,7 +296,7 @@ def render_landing_page(conn):
             </div>
             <div class="flow-card">
                 <div class="logo-box">{img_tag(logo_lph)}</div>
-                <div class="flow-label-box">Promoteur</div>
+                <div class="flow-label-box">Sponsor</div>
             </div>
         </div>
     </div>
@@ -312,17 +324,16 @@ def render_demo_accounts_table():
     )
     return _html(f"""
     <div class="lims-panel" style="max-width:820px;margin:0 auto 2rem auto;">
-        <h4>🔑 Essayer avec un compte de démonstration</h4>
+        <h4>🔑 Try a demonstration account</h4>
         <p style="font-size:0.88rem;color:#34495E;margin-bottom:0.8rem;">
-            Connectez-vous dans la barre latérale avec l'un de ces comptes pour explorer
-            l'application selon le point de vue de chaque rôle métier :
+            Log in from the sidebar with one of these accounts to explore the application from each business role perspective:
         </p>
         <table style="width:100%;border-collapse:collapse;font-size:0.88rem;">
             <thead>
                 <tr style="border-bottom:2px solid #E3E8EE;">
-                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Utilisateur</th>
-                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Mot de passe</th>
-                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Rôle</th>
+                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Username</th>
+                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Password</th>
+                    <th style="text-align:left;padding:0.5rem 0.8rem;color:#7B8794;">Role</th>
                 </tr>
             </thead>
             <tbody>{rows_html}</tbody>

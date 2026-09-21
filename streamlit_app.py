@@ -1,4 +1,6 @@
+import hashlib
 import io
+import sqlite3
 from datetime import date
 
 import pandas as pd
@@ -8,11 +10,14 @@ import streamlit as st
 from audit import log_audit
 from auth import (generate_temp_password, handle_password_reset_flow, hash_password,
                    sidebar_user_identification, validate_password_complexity)
-from automation import check_and_send_reminders, preview_automation, send_secure_report
+from automation import (check_and_send_reminders, get_monthly_vinc_compliance,
+                        get_weekly_ingestion_compliance, preview_automation, run_automation_now,
+                        send_secure_report)
 from barcode_utils import (decode_barcode_from_image, generate_barcode_png,
                             generate_sample_label_pdf, zbar_available)
-from business_logic import (build_patients_matrix, compute_oor_flag, compute_tat_hours,
-                             filter_reviewed_only, validate_ingestion_dataframe)
+from business_logic import (build_patients_matrix, compute_lbnrind, compute_oor_flag,
+                             compute_tat_hours, select_reviewed_sdtm_source, select_vinc_for_export,
+                             validate_ingestion_dataframe)
 from cdisc_export import generate_define_xml, generate_dm_domain
 from constants import (ALL_ROLES, CRITICAL_FLAG, ESIGNATURE_LEGAL_NOTICE, NORMAL_FLAG,
                         OOR_FLAG, PAGE_ICONS, PAGE_PERMISSIONS, ROLE_LABELS,
@@ -22,10 +27,12 @@ from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_st
                 get_connection, get_current_storage_location, get_or_create_patient,
                 get_or_create_sample, get_or_create_site, get_or_create_visit,
                 get_samples_pending_labels, get_samples_without_storage, get_setting,
-                get_usubjids_for_results, insert_lab_result, insert_remark, list_users,
+                get_usubjids_for_results, import_lab_results_batch, insert_lab_result, insert_remark, list_users,
                 mark_biological_validation, mark_labels_printed, mark_technical_validation,
-                read_audit_trail, read_full_results, read_remarks, set_setting,
-                set_user_active, set_user_role, username_exists)
+                create_result_correction, read_audit_trail, read_full_results, read_remarks,
+                read_result_history, set_setting, set_user_active, set_user_role, void_result,
+                username_exists)
+from export_package import build_vinc_package
 from gdpr import anonymize_patient, export_patient_data, get_all_consent, record_consent
 from hl7_import import parse_oru_r01, parse_ref_range
 from mailbox import (count_unread, get_inbox, get_message, list_active_usernames,
@@ -34,7 +41,7 @@ from pdf_reports import generate_patient_pdf_report, generate_vinc_pdf_report
 from ui import _html, inject_custom_css, kpi_card, render_landing_page, render_top_banner
 from workflow_viz import render_pipeline_svg, render_status_stepper, render_storage_map_html
 
-st.set_page_config(page_title="Projet BLOOD", page_icon="🩸", layout="wide")
+st.set_page_config(page_title="BLOOD Study LIMS", page_icon="🩸", layout="wide")
 
 
 # =====================================================================
@@ -142,48 +149,31 @@ def page_ingestion(conn, user_name):
     has_collection = "collection_datetime" in df.columns
 
     if st.button("Import into the database", disabled=not user_name):
-        progress = st.progress(0, text="Importing...")
-        n_rows = len(df)
+        progress = st.progress(0, text="Preparing import...")
+        raw_bytes = uploaded_file.getvalue()
+        source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        progress.progress(10, text="File hashed — starting atomic transaction...")
         try:
-            for i, (_, row) in enumerate(df.iterrows()):
-                site_id = get_or_create_site(conn, row["site_id"])
-                patient_id = get_or_create_patient(
-                    conn, row["patient_id"], row["usubjid"], site_id,
-                    row["subjid"], row["sex"], int(row["birth_year"]))
-                visit_id = get_or_create_visit(
-                    conn, patient_id, row["visit_code"], row["visit_date"], int(row["visit_num"]))
-                sample_type = row["sample_type"] if has_sample_type and pd.notna(row["sample_type"]) else "SERUM"
-                collection_dt = row["collection_datetime"] if has_collection and pd.notna(row["collection_datetime"]) else None
-                sample_id = get_or_create_sample(conn, patient_id, visit_id, sample_type, collection_dt)
-
-                ref_low = float(row["ref_low"]) if has_ref and pd.notna(row["ref_low"]) else None
-                ref_high = float(row["ref_high"]) if has_ref and pd.notna(row["ref_high"]) else None
-                crit_low = float(row["critical_low"]) if has_crit and pd.notna(row["critical_low"]) else None
-                crit_high = float(row["critical_high"]) if has_crit and pd.notna(row["critical_high"]) else None
-
-                insert_lab_result(
-                    conn, visit_id, row["test_code"], row["test_name"],
-                    float(row["result_value"]), row["result_unit"], row["result_date"],
-                    ref_low, ref_high, sample_id, crit_low, crit_high)
-                progress.progress((i + 1) / n_rows, text=f"Importing... {i + 1}/{n_rows}")
+            batch_id, inserted, skipped = import_lab_results_batch(
+                conn, df, user_name, uploaded_file.name or "uploaded.csv", source_sha256
+            )
+            progress.progress(100, text="Import completed")
         except Exception as e:
-            st.error(f"Import stopped due to an unexpected error on row {i + 2}: {e}. "
-                      "Rows already inserted before the error remain in the database — "
-                      "check the Audit Trail and correct manually if needed.")
-            log_audit(conn, "LAB_RESULTS", "INGESTION_CSV_PARTIAL_FAILURE", user_name,
-                      comment=str(e))
+            st.error(
+                f"❌ Import rejected — no partial business data was committed. "
+                f"Batch preserved in the audit database. Error: {e}"
+            )
             return
 
-        log_audit(conn, "LAB_RESULTS", "INGESTION_CSV", user_name, comment=f"{len(df)} lignes")
-        st.success(f"{len(df)} lignes importées, statut initial PENDING (à valider techniquement). "
-                    "Un code-barres a été assigné automatiquement à chaque nouvel échantillon "
-                    "(voir page Sample Labels).")
+        st.success(
+            f"✅ Batch {batch_id}: {inserted} line(s) imported, {skipped} identical duplicate(s) skipped. "
+            "Initial status is PENDING (technical validation required)."
+        )
         st.rerun()
 
 
 def page_sample_labels(conn, user_name):
-    """Digitalisation / traçabilité physique : émission des étiquettes
-    code-barres pour les échantillons reçus."""
+    """Physical sample traceability: barcode label generation for received samples."""
     st.title("SAMPLE LABELS (barcode printing)")
     st.caption("Generate Code128 barcode labels (50×25mm) for physical sample tubes. "
                 "Each barcode encodes the sample_id — scan it later from 'Sample Scan' "
@@ -231,15 +221,13 @@ def page_sample_labels(conn, user_name):
             )
             mark_labels_printed(conn, selected["sample_id"].tolist(), user_name)
             log_audit(conn, "SAMPLES", "LABELS_PRINTED", user_name,
-                      comment=f"{len(selected)} étiquette(s)")
+                      comment=f"{len(selected)} label(s)")
             st.success(f"{len(selected)} label(s) marked as printed.")
             st.rerun()
 
 
 def page_sample_scan(conn, user_name):
-    """Lecture code-barres : recherche instantanée d'un échantillon.
-    Fonctionne avec un scanner USB (champ texte = clavier) ou avec une
-    photo prise via la caméra du téléphone."""
+    """Barcode scanning: instant sample lookup. A USB scanner behaves like a keyboard; a phone camera can also be used."""
     st.title("SAMPLE SCAN")
 
     st.markdown('<div class="scan-box">📷 Scan with a USB scanner or type the sample ID below</div>',
@@ -308,25 +296,22 @@ def page_sample_scan(conn, user_name):
 
 
 def page_storage_map(conn):
-    """Vue d'ensemble visuelle de la chaîne de conservation : où sont
-    physiquement rangés les échantillons, et lesquels ne le sont pas
-    encore (repose sur la table STORAGE_LOCATIONS, alimentée depuis
-    Sample Scan)."""
+    """Visual chain-of-custody overview: physical storage locations and samples that still require storage."""
     st.title("🧊 STORAGE MAP")
-    st.caption("Répartition des échantillons par congélateur / rack / boîte, "
-                "et détection de ceux jamais rangés physiquement.")
+    st.caption("Distribution of samples by freezer / rack / box, "
+                "and detection of samples that have never been physically stored.")
 
     storage_df = get_all_current_storage_locations(conn)
     st.markdown(render_storage_map_html(storage_df), unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("⚠️ Échantillons jamais rangés")
+    st.subheader("⚠️ Samples never stored")
     missing_df = get_samples_without_storage(conn)
     if missing_df.empty:
-        st.success("✅ Tous les échantillons reçus ont une position de stockage enregistrée.")
+        st.success("✅ All received samples have a recorded storage position.")
     else:
-        st.warning(f"{len(missing_df)} échantillon(s) reçu(s) mais jamais rangé(s) physiquement "
-                    "(assignez une position depuis la page Sample Scan).")
+        st.warning(f"{len(missing_df)} sample(s) received but never physically stored "
+                    "(assign a storage position from the Sample Scan page).")
         st.dataframe(missing_df, use_container_width=True)
 
 
@@ -341,8 +326,20 @@ def page_technical_validation(conn, user_name):
         st.success("✅ No results pending technical validation.")
         return
 
+    visit_scope = st.selectbox(
+        "Validation scope",
+        ["All pending results", "VINC only", "V1 only", "V2 only"],
+        key="tech_scope",
+    )
+    if visit_scope != "All pending results":
+        pending_df = pending_df[pending_df["visit_code"] == visit_scope.split()[0]].copy()
+    if pending_df.empty:
+        st.info("No pending results match the selected scope.")
+        return
+
     pending_df = compute_oor_flag(pending_df)
-    pending_df.insert(0, "Validate", False)
+    select_all = st.checkbox("Select all displayed results", key="tech_select_all")
+    pending_df.insert(0, "Validate", bool(select_all))
     display_cols = ["Validate", "result_id", "usubjid", "sample_id", "barcode_value",
                      "visit_code", "test_code", "test_name", "result_value", "result_unit", "Alerte"]
     edited = st.data_editor(
@@ -354,7 +351,7 @@ def page_technical_validation(conn, user_name):
     if st.button(f"Validate {len(selected_ids)} result(s) technically", disabled=len(selected_ids) == 0):
         n = mark_technical_validation(conn, selected_ids, user_name)
         log_audit(conn, "LAB_RESULTS", "TECHNICAL_VALIDATION", user_name,
-                  comment=f"{n} résultats : {selected_ids}")
+                  comment=f"{n} results : {selected_ids}")
         st.success(f"{n} result(s) technically validated.")
         st.rerun()
 
@@ -363,25 +360,34 @@ def page_technical_validation(conn, user_name):
 # PAGES — BIOLOGIST
 # =====================================================================
 def page_biological_validation(conn, user_name):
-    """Validation biologique avec signature électronique.
-
-    Correction critique par rapport à la version précédente : on ne
-    valide QUE les résultats explicitement cochés par le biologiste
-    (comme pour la validation technique), jamais 'tout TECHNICAL_OK'
-    en une requête aveugle. Le formulaire capture aussi le "meaning of
-    signature" (raison) exigé par 21 CFR Part 11 §11.50, en plus du mot
-    de passe."""
+    """Biological validation with electronic signature. Only explicitly selected TECHNICAL_OK results can be signed.
+    The form captures the signature meaning and requires password re-authentication."""
     st.title("🧪 BIOLOGICAL VALIDATION")
     render_critical_alert_banner(conn)
 
     df = read_full_results(conn)
     pending_df = df[df["status"] == "TECHNICAL_OK"].copy()
     if pending_df.empty:
-        st.info("Aucun résultat en attente de validation biologique.")
+        st.info("No results are awaiting biological validation.")
+        return
+
+    review_scope = st.selectbox(
+        "Review scope",
+        ["All TECHNICAL_OK results", "VINC only", "Critical results only"],
+        key="bio_scope",
+    )
+    if review_scope == "VINC only":
+        pending_df = pending_df[pending_df["visit_code"] == "VINC"].copy()
+    elif review_scope == "Critical results only":
+        pending_df = compute_oor_flag(pending_df)
+        pending_df = pending_df[pending_df["Alerte"] == CRITICAL_FLAG].copy()
+    if pending_df.empty:
+        st.info("No results match the selected review scope.")
         return
 
     pending_df = compute_oor_flag(pending_df)
-    pending_df.insert(0, "Sign", False)
+    select_all = st.checkbox("Select all displayed results", key="bio_select_all")
+    pending_df.insert(0, "Sign", bool(select_all))
     display_cols = ["Sign", "result_id", "usubjid", "visit_code", "sample_id",
                      "test_code", "test_name", "result_value", "result_unit",
                      "Alerte", "technical_validated_by"]
@@ -390,53 +396,48 @@ def page_biological_validation(conn, user_name):
         disabled=[c for c in display_cols if c != "Sign"], key="bio_editor",
     )
     selected_ids = edited.loc[edited["Sign"], "result_id"].astype(int).tolist()
-    st.write(f"**{len(selected_ids)} résultat(s)** sélectionné(s) pour signature.")
+    st.write(f"**{len(selected_ids)} result(s)** selected for signature.")
 
     st.markdown("---")
-    st.subheader("🖋 Signature Électronique (21 CFR Part 11)")
+    st.subheader("🖋 Electronic Signature (21 CFR Part 11)")
 
     st.info(f"ℹ️ {ESIGNATURE_LEGAL_NOTICE}")
 
     with st.form("form_esignature_bio"):
         reason = st.selectbox("Meaning of this signature", SIGNATURE_REASONS)
-        remarks = st.text_area("Remarques / observations",
-                                placeholder="Ex: Résultats conformes au protocole. RAS.")
-        st.caption("🔒 Conformité Part 11 : ressaisissez votre mot de passe pour valider et "
-                    "signer l'acte médical. Seuls les résultats cochés ci-dessus seront signés.")
-        password_input = st.text_input("Mot de passe", type="password")
-        submit = st.form_submit_button("Signer et valider définitivement")
+        remarks = st.text_area("Remarks / observations",
+                                placeholder="e.g. Results reviewed against the study procedure. No additional comment.")
+        st.caption("🔒 Part 11 control: re-enter your password to validate and "
+                    "sign the review. Only the results checked above will be signed.")
+        password_input = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Sign and finalize validation")
 
         if submit:
             if not selected_ids:
-                st.error("Aucun résultat sélectionné — cochez au moins une ligne ci-dessus.")
+                st.error("No result selected — check at least one row above.")
             elif not password_input:
-                st.error("Le mot de passe est obligatoire pour signer.")
+                st.error("Password is required to sign.")
             else:
                 from auth import check_password, get_user_record
                 record = get_user_record(conn, user_name)
                 if record is None or not check_password(password_input, record["password_hash"]):
-                    st.error("Mot de passe incorrect — signature refusée.")
+                    st.error("Incorrect password — signature rejected.")
                     log_audit(conn, "LAB_RESULTS", "BIOLOGICAL_SIGNATURE_FAILED", user_name,
-                              comment=f"{len(selected_ids)} résultats visés")
+                              comment=f"{len(selected_ids)} targeted results")
                 else:
                     n = mark_biological_validation(conn, selected_ids, user_name, reason, remarks)
                     log_audit(conn, "LAB_RESULTS", "BIOLOGICAL_SIGNATURE", user_name,
                               record_ref=str(selected_ids),
-                              comment=f"{n} résultats signés. Reason={reason}. Remarks={remarks}")
-                    st.success(f"✅ {n} résultat(s) validé(s) et signé(s) biologiquement avec succès !")
+                              comment=f"{n} signed results. Reason={reason}. Remarks={remarks}")
+                    st.success(f"✅ {n} result(s) biologically validated and electronically signed.")
 
                     _maybe_auto_send_reports(conn, selected_ids, user_name)
                     st.rerun()
 
 
 def _maybe_auto_send_reports(conn, result_ids, user_name):
-    """Si activé dans Settings/Automation, génère et livre automatiquement
-    le compte rendu des patients concernés par cette signature biologique
-    dans la Messagerie interne des destinataires configurés (fonctionne
-    toujours, sans SMTP). Un e-mail SMTP réel chiffré par mot de passe
-    est envoyé EN PLUS si un mot de passe de chiffrement est configuré.
-    Échoue silencieusement (log en audit trail) — ne doit jamais bloquer
-    la validation elle-même, qui est déjà actée en base."""
+    """When enabled in Settings/Automation, generates and delivers a patient PDF report to configured internal-mailbox recipients.
+    Optional SMTP delivery is added when configured. Delivery failure is logged and never reverses an already completed validation."""
     if get_setting(conn, "auto_send_reports_enabled", "0") != "1":
         return
     recipients = [r.strip() for r in (get_setting(conn, "notify_emails_physician", "") or "").split(",") if r.strip()]
@@ -446,8 +447,8 @@ def _maybe_auto_send_reports(conn, result_ids, user_name):
     report_password = get_setting(conn, "report_pdf_password")
     usubjids = get_usubjids_for_results(conn, result_ids)
     for usubjid in usubjids:
-        subject = f"Compte rendu biologique — {usubjid}"
-        body = f"Le compte rendu biologique de {usubjid} vient d'être validé et signé. Voir la pièce jointe."
+        subject = f"Biological report — {usubjid}"
+        body = f"The biological report for {usubjid} has been validated and signed. See the attachment."
         filename = f"{usubjid}_report_{date.today()}.pdf"
 
         # Livraison interne (toujours disponible, PDF non chiffré car déjà
@@ -457,7 +458,7 @@ def _maybe_auto_send_reports(conn, result_ids, user_name):
         if pdf_bytes_internal is not None:
             n_delivered = send_internal_message_to_many(
                 conn, recipients, subject, body,
-                sender_username=user_name, sender_label="Automatisation LIMS",
+                sender_username=user_name, sender_label="BLOOD LIMS Automation",
                 attachment_bytes=pdf_bytes_internal, attachment_name=filename,
                 attachment_mimetype="application/pdf",
             )
@@ -468,7 +469,7 @@ def _maybe_auto_send_reports(conn, result_ids, user_name):
             pdf_bytes_encrypted = generate_patient_pdf_report(conn, usubjid, user_name, password=report_password)
             also_emailed = send_secure_report(
                 subject=f"[BLOOD Study] {subject}",
-                body=body + " (PDF protégé par mot de passe, communiqué séparément.)",
+                body=body + " (password-protected PDF; password communicated separately.)",
                 recipients=recipients, attachment_bytes=pdf_bytes_encrypted,
                 attachment_filename=filename,
             )
@@ -483,56 +484,49 @@ def _maybe_auto_send_reports(conn, result_ids, user_name):
 # PAGES — CRO / DASHBOARD
 # =====================================================================
 def page_process_flow(conn):
-    """Vue visuelle du pipeline : le schéma d'ensemble avec les
-    compteurs en direct, puis un tableau façon Kanban listant les
-    échantillons à chaque étape — pour voir d'un coup d'œil où en est
-    l'étude sans lire une ligne de log."""
+    """Workflow visualization: live counters plus a Kanban-style view of samples at each workflow stage."""
     st.title("PROCESS FLOW")
     render_critical_alert_banner(conn)
 
-    st.caption("Schéma vivant du pipeline : les compteurs reflètent l'état actuel de la base.")
+    st.caption("Live workflow diagram: counters reflect the current database state.")
     svg = render_pipeline_svg(conn)
     st.markdown(f'<div style="max-width:760px;margin:0 auto;">{svg}</div>', unsafe_allow_html=True)
 
     st.markdown("---")
-    st.subheader("Échantillons par étape")
+    st.subheader("Samples by workflow stage")
     df = read_full_results(conn)
     if df.empty:
-        st.info("Aucune donnée disponible.")
+        st.info("No data available.")
         return
 
     col_pending, col_tech, col_reviewed = st.columns(3)
     stage_cols = {
-        "PENDING": (col_pending, "⏳ En attente technicien"),
-        "TECHNICAL_OK": (col_tech, "🔬 En attente biologiste"),
-        "REVIEWED": (col_reviewed, "✅ Validés"),
+        "PENDING": (col_pending, "⏳ Awaiting technical validation"),
+        "TECHNICAL_OK": (col_tech, "🔬 Awaiting biological validation"),
+        "REVIEWED": (col_reviewed, "✅ Reviewed"),
     }
     for status, (col, title) in stage_cols.items():
         with col:
             st.markdown(f"**{title}**")
             stage_df = df[df["status"] == status]
             if stage_df.empty:
-                st.caption("Rien ici.")
+                st.caption("Nothing here.")
             else:
                 summary = stage_df.groupby("usubjid").size().reset_index(name="n_resultats")
                 for _, row in summary.head(15).iterrows():
                     st.markdown(_html(f"""
                     <div class="search-result-card" style="padding:0.5rem 0.8rem; margin-bottom:0.5rem;">
                         <strong>{row['usubjid']}</strong><br/>
-                        <span style="font-size:0.8rem;color:#7B8794;">{row['n_resultats']} résultat(s)</span>
+                        <span style="font-size:0.8rem;color:#7B8794;">{row['n_resultats']} result(s)</span>
                     </div>
                     """), unsafe_allow_html=True)
                 if len(summary) > 15:
-                    st.caption(f"... et {len(summary) - 15} de plus.")
+                    st.caption(f"... and {len(summary) - 15} more.")
 
 
 def page_mon_compte(conn, user_name, role, full_name):
-    """Espace personnel : informations de profil, poste, e-mail, et
-    changement de mot de passe. Le nom d'utilisateur et le rôle restent
-    en lecture seule ici — les modifier engage le contrôle d'accès de
-    toute l'application, c'est pour ça que c'est réservé au CRO via
-    User Management (voir la note affichée plus bas)."""
-    st.title("🪪 MON COMPTE")
+    """Personal account area: profile, job title, e-mail and password change. Username and role are read-only here and remain CRO-controlled."""
+    st.title("🪪 MY ACCOUNT")
 
     cur = conn.execute(
         "SELECT full_name, email, job_title FROM USERS WHERE username = ?", (user_name,)
@@ -543,11 +537,11 @@ def page_mon_compte(conn, user_name, role, full_name):
     col_info, col_badge = st.columns([2, 1])
     with col_info:
         with st.form("mon_compte_form"):
-            new_full_name = st.text_input("Nom complet", value=current_full_name or "")
-            new_job_title = st.text_input("Poste / fonction", value=current_job_title or "",
-                                            placeholder="ex: Technicienne de laboratoire, Site FR-001")
+            new_full_name = st.text_input("Full name", value=current_full_name or "")
+            new_job_title = st.text_input("Job title", value=current_job_title or "",
+                                            placeholder="e.g. Laboratory Technician, Site FR-001")
             new_email = st.text_input("E-mail", value=current_email or "")
-            submitted = st.form_submit_button("Enregistrer")
+            submitted = st.form_submit_button("Save")
             if submitted:
                 conn.execute(
                     "UPDATE USERS SET full_name = ?, job_title = ?, email = ? WHERE username = ?",
@@ -556,7 +550,7 @@ def page_mon_compte(conn, user_name, role, full_name):
                 conn.commit()
                 log_audit(conn, "USERS", "PROFILE_UPDATED", user_name)
                 st.session_state.auth_full_name = new_full_name
-                st.success("Profil mis à jour.")
+                st.success("Profile updated.")
                 st.rerun()
 
     with col_badge:
@@ -568,19 +562,19 @@ def page_mon_compte(conn, user_name, role, full_name):
         </div>
         """), unsafe_allow_html=True)
 
-    st.caption("ℹ️ Le nom d'utilisateur et le rôle ne sont pas modifiables ici — un changement "
-                "de rôle affecte les droits d'accès à toute l'application et reste réservé au "
-                "CRO (page User Management), par principe de séparation des responsabilités.")
+    st.caption("ℹ️ Username and role cannot be changed here — a role change "
+                "affects application access rights and remains restricted to the "
+                "CRO (User Management page), following separation of duties.")
 
     st.markdown("---")
-    st.subheader("🔒 Changer mon mot de passe")
+    st.subheader("🔒 Change my password")
     with st.form("mon_compte_password_form"):
-        new_pwd = st.text_input("Nouveau mot de passe", type="password")
-        confirm_pwd = st.text_input("Confirmer le nouveau mot de passe", type="password")
-        pwd_submitted = st.form_submit_button("Mettre à jour le mot de passe")
+        new_pwd = st.text_input("New password", type="password")
+        confirm_pwd = st.text_input("Confirm new password", type="password")
+        pwd_submitted = st.form_submit_button("Update password")
         if pwd_submitted:
             if new_pwd != confirm_pwd:
-                st.error("Les mots de passe ne correspondent pas.")
+                st.error("Passwords do not match.")
             else:
                 ok, msg = validate_password_complexity(new_pwd)
                 if not ok:
@@ -589,23 +583,19 @@ def page_mon_compte(conn, user_name, role, full_name):
                     from auth import update_password
                     update_password(conn, user_name, new_pwd)
                     log_audit(conn, "USERS", "PASSWORD_CHANGED", user_name)
-                    st.success("Mot de passe mis à jour.")
+                    st.success("Password updated.")
 
 
 def page_messagerie(conn, user_name):
-    """Messagerie interne : reçoit réellement les relances de
-    l'automatisation (voir automation.py / mailbox.py) et permet
-    d'envoyer un message à un autre utilisateur de l'application —
-    même principe qu'une messagerie universitaire (compte du site,
-    pas un vrai fournisseur e-mail externe)."""
-    st.title("📧 MESSAGERIE")
+    """Internal mailbox: receives automation messages and allows users to message one another. It is an application mailbox, not an external e-mail provider."""
+    st.title("📧 MAILBOX")
 
-    tab_inbox, tab_compose = st.tabs(["📥 Boîte de réception", "✉️ Nouveau message"])
+    tab_inbox, tab_compose = st.tabs(["📥 Inbox", "✉️ New message"])
 
     with tab_inbox:
         inbox = get_inbox(conn, user_name)
         if inbox.empty:
-            st.info("Aucun message pour l'instant.")
+            st.info("No messages yet.")
         else:
             for _, row in inbox.iterrows():
                 unread = not bool(row["is_read"])
@@ -626,18 +616,18 @@ def page_messagerie(conn, user_name):
     with tab_compose:
         recipients = list_active_usernames(conn, exclude_username=user_name)
         if not recipients:
-            st.info("Aucun autre utilisateur actif à qui écrire.")
+            st.info("No other active user is available to message.")
         else:
             with st.form("compose_form"):
                 options = {f"{full_name} (@{uname}) — {ROLE_LABELS.get(role, role)}": uname
                            for uname, full_name, role in recipients}
-                choice = st.selectbox("Destinataire", list(options.keys()))
-                subject = st.text_input("Objet")
+                choice = st.selectbox("Recipient", list(options.keys()))
+                subject = st.text_input("Subject")
                 body = st.text_area("Message")
-                submitted = st.form_submit_button("Envoyer")
+                submitted = st.form_submit_button("Send")
                 if submitted:
                     if not subject or not body:
-                        st.error("Objet et message sont obligatoires.")
+                        st.error("Subject and message are required.")
                     else:
                         sender_row = conn.execute(
                             "SELECT full_name FROM USERS WHERE username = ?", (user_name,)
@@ -647,60 +637,55 @@ def page_messagerie(conn, user_name):
                                                sender_username=user_name, sender_label=sender_label)
                         log_audit(conn, "MESSAGES", "MESSAGE_SENT", user_name,
                                   record_ref=options[choice])
-                        st.success("Message envoyé.")
+                        st.success("Message sent.")
                         st.rerun()
 
 
 def page_guide(role):
-    """Aide contextuelle intégrée : condensé du guide complet, adapté à
-    ce que CE rôle voit réellement. Objectif : qu'un nouvel utilisateur
-    (ou un visiteur en démo) comprenne le 'pourquoi' sans quitter l'appli."""
     st.title("❓ GUIDE")
-    st.caption("Un guide complet et détaillé (avec glossaire et scénario de démonstration) "
-                "est disponible séparément — demandez-le si besoin.")
+    st.caption("Role-specific in-app guidance. The full SOP and demonstration guide are provided with the project package.")
 
-    st.subheader("Le principe général")
+    st.subheader("General principle")
     st.write(
-        "Chaque résultat suit un même trajet : **Ingestion** (CSV ou HL7) → "
-        "**Échantillon + code-barres** → **Validation technique** → "
-        "**Validation biologique (signature électronique)** → **Diffusion** "
-        "(dossier patient, export sponsor, export réglementaire CDISC). "
-        "Chaque étape existe pour une raison réglementaire précise : la double "
-        "validation (technicien puis biologiste) est l'exigence classique de "
-        "vérification indépendante en biologie médicale et en essai clinique."
+        "Every result follows the same path: **Ingestion** (CSV or HL7) → **Sample + barcode** → "
+        "**Technical validation** → **Biological validation (electronic signature)** → **Distribution** "
+        "(patient record, sponsor package, CDISC-oriented export). Each step supports controlled data quality, "
+        "traceability and separation of responsibilities."
     )
 
     role_help = {
         "LAB_TECH": [
-            ("📥 Data Ingestion", "Importez le fichier CSV hebdomadaire du laboratoire central. "
-             "Tout est vérifié AVANT d'être écrit en base — si une ligne est invalide, rien n'est importé."),
-            ("🔌 HL7 Import", "Alternative au CSV si votre labo envoie directement un message HL7 v2."),
-            ("🏷️ Sample Labels", "Imprimez les étiquettes code-barres des nouveaux échantillons reçus."),
-            ("📷 Sample Scan", "Scannez (ou tapez) un code-barres pour retrouver instantanément un échantillon."),
-            ("🧪 Technical Validation", "Premier contrôle qualité : cochez les résultats plausibles pour les faire avancer."),
+            ("📥 Data Ingestion", "Import the weekly CSV file from the central laboratory. Everything is validated before database write; an invalid file is rejected as a batch."),
+            ("🔌 HL7 Import", "Import a previously received HL7 v2 ORU^R01 message and map it explicitly to VINC, V1 or V2."),
+            ("🏷️ Sample Labels", "Generate barcode labels for newly received samples."),
+            ("📷 Sample Scan", "Scan or type a barcode to retrieve sample custody and result information."),
+            ("🧪 Technical Validation", "Select the results you have checked and move them from PENDING to TECHNICAL_OK."),
         ],
         "BIOLOGIST": [
-            ("🧬 Biological Validation", "Validation médicale finale. Cochez les résultats à signer, choisissez le motif "
-             "de signature, ressaisissez votre mot de passe — cette signature a la même valeur qu'une signature manuscrite."),
-            ("👤 Patient Records", "Consultez le dossier complet d'un patient et la tendance de ses biomarqueurs."),
+            ("🧬 Biological Validation", "Select TECHNICAL_OK results, choose the signature meaning, re-enter your password and electronically sign the selected results."),
+            ("👤 Patient Records", "Review patient history and biomarker trends."),
+            ("📝 Notes", "Add a time-stamped observation to a result."),
         ],
         "PHYSICIAN": [
-            ("👤 Patient Records", "Suivez vos patients inclus dans l'essai : résultats validés, tendance dans le temps, rapport PDF."),
-            ("📝 Notes", "Ajoutez une observation clinique horodatée sur un résultat."),
+            ("👤 Patient Records", "Review the patient record, validated results and trends."),
+            ("📝 Notes", "Document a dated observation linked to a laboratory result."),
+            ("📧 Mailbox", "Read reports and alerts delivered by the application."),
         ],
         "CRO": [
-            ("📊 Dashboard", "KPI globaux : nombre de résultats, patients, valeurs critiques, délai moyen de traitement."),
-            ("🧭 Process Flow", "Le pipeline en un coup d'œil, avec les compteurs en direct."),
-            ("👥 User Management", "Créez ou désactivez des comptes, réinitialisez un mot de passe."),
-            ("📦 Export CDISC SDTM", "Export réglementaire (domaines LB, DM) + define.xml, prêt pour un dépôt."),
-            ("🔒 Data Privacy", "Droits RGPD : export des données d'un patient, pseudonymisation, consentement."),
-            ("🕵️ Audit Trail", "Le journal de TOUT ce qui s'est passé — non modifiable, non supprimable."),
+            ("📊 Dashboard", "Monitor global KPIs and critical results."),
+            ("🧭 Process Flow", "View the live laboratory workflow."),
+            ("📦 VINC extraction", "Prepare the official VINC sponsor package using a documented cut-off and reviewed-only eligibility."),
+            ("🤖 Automation", "Preview, execute and audit weekly/monthly automation jobs; use the controlled demo mode for the presentation."),
+            ("✏️ Data Correction / Void", "Create a controlled superseding version or void a record with a mandatory reason; the original remains traceable."),
+            ("🕵️ Audit Trail", "Review the append-only event history, including old/new values for controlled changes."),
+            ("📦 Export CDISC SDTM", "Generate the LB/DM starter exports and define.xml for the training scope."),
+            ("🔒 Data Privacy", "Use the application-level privacy and consent controls for the training dataset."),
         ],
         "SPONSOR": [
-            ("📤 VINC extraction", "Votre extrait mensuel des résultats de la visite d'inclusion (VINC)."),
+            ("📤 VINC extraction", "View and download the reviewed VINC sponsor package available at the documented cut-off."),
+            ("📧 Mailbox", "Receive the monthly sponsor package automatically in the internal mailbox."),
         ],
     }
-
     for title, explanation in role_help.get(role, []):
         with st.container(border=True):
             st.markdown(f"**{title}**")
@@ -890,11 +875,11 @@ def page_patient_records(conn, user_name, role):
             log_audit(conn, "LAB_RESULTS", "EXPORT_PDF_PATIENT", user_name, record_ref=selected)
 
     st.subheader("Results")
-    st.caption("Où en est chaque visite dans le workflow de validation :")
+    st.caption("Current validation status for each visit:")
     for visit_code_iter in patient_df["visit_code"].unique():
         visit_status_series = patient_df[patient_df["visit_code"] == visit_code_iter]["status"]
-        # Le statut le "moins avancé" de la visite prime : une visite n'est
-        # affichée comme validée que si TOUS ses résultats le sont.
+        # The least advanced visit status is used : une visit n'est
+        # affichée comme validée que si TOUS ses results le sont.
         order = {"PENDING": 0, "TECHNICAL_OK": 1, "REVIEWED": 2}
         least_advanced = min(visit_status_series, key=lambda s: order.get(s, 0))
         st.markdown(f"**{visit_code_iter}**")
@@ -939,15 +924,13 @@ def page_patient_records(conn, user_name, role):
 
 
 def page_hl7_import(conn, user_name):
-    """Import de résultats via message HL7 v2 (ORU^R01) — voir
-    hl7_import.py pour ce que ce parseur fait et ne fait pas
-    (notamment : pas d'écoute réseau temps réel MLLP/RS-232)."""
+    """Import of results via an HL7 v2 message (ORU^R01). The parser does not provide a real-time MLLP/RS-232 listener."""
     st.title("HL7 IMPORT")
-    st.caption("Importe un message HL7 v2.x (segment ORU^R01) exporté depuis un automate ou "
-                "un LIS existant. La correspondance avec vos visites d'essai (VINC/V1/V2) est "
-                "choisie ci-dessous, car HL7 ne connaît pas votre plan de visites.")
+    st.caption("Imports an HL7 v2.x message (ORU^R01 segment) exported from an analyzer or "
+                "an existing LIS. Mapping to the study visits (VINC/V1/V2) is "
+                "selected below because HL7 does not know the study visit plan.")
 
-    uploaded_file = st.file_uploader("Fichier HL7 (.hl7 ou .txt)", type=["hl7", "txt"])
+    uploaded_file = st.file_uploader("HL7 file (.hl7 or .txt)", type=["hl7", "txt"])
     if uploaded_file is None:
         return
 
@@ -955,17 +938,17 @@ def page_hl7_import(conn, user_name):
     parsed = parse_oru_r01(raw_text)
 
     if parsed.warnings:
-        with st.expander(f"⚠️ {len(parsed.warnings)} avertissement(s) de lecture", expanded=True):
+        with st.expander(f"⚠️ {len(parsed.warnings)} read warning(s)", expanded=True):
             for w in parsed.warnings:
                 st.write(f"- {w}")
 
     if not parsed.patient_identifier or not parsed.observations:
-        st.error("Message illisible ou incomplet — impossible de continuer l'import.")
+        st.error("Unreadable or incomplete message — import cannot continue.")
         return
 
-    st.success(f"Patient détecté : {parsed.patient_identifier} "
-               f"(sexe {parsed.patient_sex or '?'}, naissance {parsed.patient_birth_year or '?'})")
-    st.subheader(f"{len(parsed.observations)} résultat(s) détecté(s)")
+    st.success(f"Patient detected: {parsed.patient_identifier} "
+               f"(sex {parsed.patient_sex or '?'}, birth year {parsed.patient_birth_year or '?'})")
+    st.subheader(f"{len(parsed.observations)} result(s) detected")
     preview_rows = []
     for obs in parsed.observations:
         low, high = parse_ref_range(obs.ref_range)
@@ -975,22 +958,22 @@ def page_hl7_import(conn, user_name):
         })
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
 
-    st.subheader("Rattachement à l'essai")
+    st.subheader("Clinical trial mapping")
     with st.form("hl7_mapping_form"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            site_id = st.text_input("Site ID", placeholder="ex: FR-001")
+            site_id = st.text_input("Site ID", placeholder="e.g. FR-001")
         with col2:
-            visit_code = st.selectbox("Visite", ["VINC", "V1", "V2"])
+            visit_code = st.selectbox("Visit", ["VINC", "V1", "V2"])
         with col3:
-            visit_num = st.number_input("N° de visite", min_value=1, value=1, step=1)
-        visit_date = st.date_input("Date de visite")
-        sample_type = st.selectbox("Type d'échantillon", ["SERUM", "WHOLE_BLOOD", "PLASMA"])
-        submitted = st.form_submit_button("Importer ces résultats")
+            visit_num = st.number_input("Visit number", min_value=1, value=1, step=1)
+        visit_date = st.date_input("Visit date")
+        sample_type = st.selectbox("Sample type", ["SERUM", "WHOLE_BLOOD", "PLASMA"])
+        submitted = st.form_submit_button("Import these results")
 
         if submitted:
             if not site_id:
-                st.error("Le site ID est obligatoire.")
+                st.error("Site ID is required.")
             else:
                 usubjid = f"BLOOD-{site_id}-{parsed.patient_identifier}"
                 get_or_create_site(conn, site_id)
@@ -1006,79 +989,76 @@ def page_hl7_import(conn, user_name):
                     try:
                         value = float(obs.value)
                     except ValueError:
-                        st.warning(f"Valeur non numérique ignorée pour {obs.test_code} : '{obs.value}'")
+                        st.warning(f"Non-numeric value ignored for {obs.test_code} : '{obs.value}'")
                         continue
                     insert_lab_result(conn, visit_id, obs.test_code, obs.test_name, value,
                                        obs.unit, str(visit_date), low, high, sample_id)
 
                 log_audit(conn, "LAB_RESULTS", "INGESTION_HL7", user_name,
-                          record_ref=usubjid, comment=f"{len(parsed.observations)} résultats")
-                st.success(f"{len(parsed.observations)} résultat(s) importé(s) pour {usubjid}, "
-                           "statut PENDING (à valider techniquement).")
+                          record_ref=usubjid, comment=f"{len(parsed.observations)} results")
+                st.success(f"{len(parsed.observations)} result(s) imported for {usubjid}, "
+                           "status PENDING (technical validation required).")
                 st.rerun()
 
 
 def page_data_privacy(conn, user_name):
-    """Droits RGPD (export, pseudonymisation) et journal de consentement.
-    Voir gdpr.py — cette page rapproche l'appli de la conformité RGPD
-    mais ne remplace pas un hébergement certifié HDS pour de vraies
-    données patients (voir README)."""
+    """Privacy controls (data export, pseudonymisation and consent logging). These application controls do not replace compliant hosting for real patient health data."""
     st.title("DATA PRIVACY (RGPD)")
 
     tab_export, tab_anon, tab_consent = st.tabs(
-        ["Droit d'accès (export)", "Pseudonymisation", "Journal de consentement"])
+        ["Access right (export)", "Pseudonymisation", "Consent log"])
 
     with tab_export:
-        st.caption("Génère un export complet des données détenues sur un patient (art. 15 RGPD).")
+        st.caption("Generates a complete export of data held for a patient (GDPR Article 15).")
         df = read_full_results(conn)
         if df.empty:
-            st.info("Aucune donnée disponible.")
+            st.info("No data available.")
         else:
             selected = st.selectbox("Patient", sorted(df["usubjid"].unique().tolist()), key="export_patient")
-            if st.button("Générer l'export JSON"):
+            if st.button("Generate JSON export"):
                 import json
                 data = export_patient_data(conn, selected)
                 json_bytes = json.dumps(data, indent=2, ensure_ascii=False, default=str).encode("utf-8")
                 log_audit(conn, "PATIENTS", "GDPR_EXPORT", user_name, record_ref=selected)
-                st.download_button("⬇️ Télécharger l'export", json_bytes,
+                st.download_button("⬇️ Download export", json_bytes,
                                     file_name=f"{selected}_gdpr_export_{date.today()}.json",
                                     mime="application/json")
 
     with tab_anon:
-        st.caption("Pseudonymise un patient : généralise l'année de naissance par tranche de "
-                    "5 ans et retire l'identifiant local. Les données cliniques (résultats, "
-                    "validations) sont conservées — obligation légale de conservation des "
-                    "données d'essai clinique. Action irréversible, enregistrée dans l'audit trail.")
+        st.caption("Pseudonymises a patient: generalises the birth year to a "
+                    "5 -year band and removes the local identifier. Clinical data (results, "
+                    "validations) are retained — clinical trial retention requirements apply. "
+                    "This action is irreversible and recorded in the Audit Trail.")
         df = read_full_results(conn)
         if not df.empty:
             selected = st.selectbox("Patient", sorted(df["usubjid"].unique().tolist()), key="anon_patient")
-            confirm = st.checkbox(f"Je confirme vouloir pseudonymiser {selected}")
-            if st.button("Pseudonymiser", disabled=not confirm):
+            confirm = st.checkbox(f"I confirm that I want to pseudonymise {selected}")
+            if st.button("Pseudonymise", disabled=not confirm):
                 ok = anonymize_patient(conn, selected, user_name)
                 if ok:
-                    st.success(f"{selected} a été pseudonymisé.")
+                    st.success(f"{selected} was pseudonymised.")
                     st.rerun()
 
     with tab_consent:
-        st.caption("Journal des statuts de consentement (le document signé lui-même n'est "
-                    "PAS stocké ici, seule une référence).")
+        st.caption("Consent status log (the signed document itself is "
+                    "NOT stored here; only a reference is stored).")
         df = read_full_results(conn)
         if not df.empty:
             with st.form("consent_form"):
                 selected = st.selectbox("Patient", sorted(df["usubjid"].unique().tolist()), key="consent_patient")
                 patient_id = df[df["usubjid"] == selected].iloc[0]["patient_id"]
-                status = st.selectbox("Statut", ["GRANTED", "WITHDRAWN", "AMENDED"])
-                doc_ref = st.text_input("Référence du document (ex: nom de fichier, ID e-CRF)")
-                submitted = st.form_submit_button("Enregistrer")
+                status = st.selectbox("Status", ["GRANTED", "WITHDRAWN", "AMENDED"])
+                doc_ref = st.text_input("Document reference (e.g. file name, eCRF ID)")
+                submitted = st.form_submit_button("Save")
                 if submitted:
                     record_consent(conn, patient_id, selected, status, doc_ref, user_name)
-                    st.success("Consentement enregistré.")
+                    st.success("Consent record saved.")
                     st.rerun()
 
-        st.subheader("Historique")
+        st.subheader("History")
         consent_df = get_all_consent(conn)
         if consent_df.empty:
-            st.info("Aucun consentement enregistré.")
+            st.info("No consent records found.")
         else:
             st.dataframe(consent_df, use_container_width=True)
 
@@ -1092,9 +1072,9 @@ def page_export_sdtm(conn, user_name):
     tab_lb, tab_dm, tab_define = st.tabs(["LB domain", "DM domain", "define.xml"])
 
     with tab_lb:
-        df = read_full_results(conn)
+        df = select_reviewed_sdtm_source(read_full_results(conn))
         if df.empty:
-            st.info("No data to export.")
+            st.info("No REVIEWED data available for the final SDTM LB export.")
         else:
             df = df.sort_values(["usubjid", "visit_num", "test_code"]).copy()
             df["LBSEQ"] = df.groupby("usubjid").cumcount() + 1
@@ -1103,6 +1083,9 @@ def page_export_sdtm(conn, user_name):
                 "LBTESTCD": df["test_code"], "LBTEST": df["test_name"],
                 "LBORRES": df["result_value"].astype(str), "LBORRESU": df["result_unit"],
                 "LBSTRESN": df["result_value"], "LBSTRESU": df["result_unit"],
+                "LBNRIND": [compute_lbnrind(v, lo, hi) for v, lo, hi in
+                            zip(df["result_value"], df["ref_low"], df["ref_high"])],
+                "LBBLFL": df["visit_code"].apply(lambda v: "Y" if v == "VINC" else ""),
                 "VISITNUM": df["visit_num"], "VISIT": df["visit_code"], "LBDTC": df["result_date"],
             })
             st.dataframe(sdtm, use_container_width=True)
@@ -1135,9 +1118,9 @@ def page_export_sdtm(conn, user_name):
 
 
 def page_user_management(conn, user_name):
-    """Réservée au CRO : création, désactivation, changement de rôle,
-    réinitialisation de mot de passe. Sans cette page, la seule façon
-    d'ajouter un utilisateur était d'éditer schema.sql à la main."""
+    """CRO-only: create, deactivate, change role,
+    reset passwords. Without this page, the only way
+    to add a user would be to edit schema.sql manually."""
     st.title("USER MANAGEMENT")
     st.caption("Manage accounts for all roles. Passwords are never shown except once, "
                 "right after creation or reset — write it down or share it securely, "
@@ -1224,6 +1207,133 @@ def page_user_management(conn, user_name):
                     st.code(temp_password)
 
 
+
+def page_data_correction(conn, user_name):
+    """CRO-only controlled correction/void page.
+
+    The original record is never overwritten. A correction creates a new
+    PENDING version linked through supersedes_result_id; a void marks the
+    active record VOID. Both actions require a documented reason and are
+    recorded in the immutable audit trail by the database layer.
+    """
+    st.title("DATA CORRECTION / VOID")
+    st.caption(
+        "Controlled post-entry changes. The original record is preserved; "
+        "corrections create a new PENDING version and voids make the active "
+        "record ineligible for official exports. A documented reason is mandatory."
+    )
+
+    active_df = read_full_results(conn)
+    if active_df.empty:
+        st.info("No active laboratory results are available.")
+        return
+
+    # Only active records are actionable. Historical versions remain visible
+    # below after an operation for traceability.
+    st.subheader("Select an active result")
+    active_df = active_df.copy()
+    active_df["display_label"] = active_df.apply(
+        lambda r: (
+            f"#{int(r['result_id'])} — {r['usubjid']} — "
+            f"{r['visit_code']} — {r['test_code']} — {r['result_value']} {r['result_unit'] or ''}"
+        ), axis=1,
+    )
+    labels = active_df["display_label"].tolist()
+    choice = st.selectbox("Result", labels, key="correction_result_select")
+    result_id = int(choice.split(" — ")[0].lstrip("#"))
+    selected = active_df[active_df["result_id"] == result_id].iloc[0]
+
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Subject", selected["usubjid"])
+        c2.metric("Visit", selected["visit_code"])
+        c3.metric("Test", selected["test_code"])
+        c4.metric("Current value", f"{selected['result_value']} {selected['result_unit'] or ''}")
+        st.write(
+            f"**Status:** {selected['status']} · **Record status:** {selected['record_status']} · "
+            f"**Result date:** {selected['result_date']}"
+        )
+
+    st.markdown("---")
+    col_correct, col_void = st.columns(2)
+
+    with col_correct:
+        st.subheader("Create a corrected version")
+        try:
+            current_value = float(selected["result_value"])
+        except (TypeError, ValueError):
+            current_value = 0.0
+        new_value = st.number_input(
+            "Corrected result value",
+            value=current_value,
+            format="%.6g",
+            key="correction_new_value",
+        )
+        correction_reason = st.text_area(
+            "Documented reason (mandatory)",
+            placeholder=(
+                "Example: Source laboratory correction received; the original result "
+                "was transcribed incorrectly."
+            ),
+            key="correction_reason",
+        )
+        if st.button("Create corrected version", type="primary", key="btn_create_correction"):
+            if not correction_reason.strip():
+                st.error("A documented change reason is required.")
+            elif float(new_value) == current_value:
+                st.error("Enter a corrected value different from the current value.")
+            else:
+                try:
+                    new_id = create_result_correction(
+                        conn, result_id, float(new_value), correction_reason, user_name
+                    )
+                    st.success(
+                        f"Correction created as result #{new_id}. The original result #{result_id} "
+                        "is preserved as SUPERSEDED and the new version is PENDING."
+                    )
+                    st.rerun()
+                except (ValueError, sqlite3.Error) as exc:
+                    st.error(f"Correction could not be created: {exc}")
+
+    with col_void:
+        st.subheader("Void the active result")
+        void_reason = st.text_area(
+            "Void reason (mandatory)",
+            placeholder=(
+                "Example: Result invalidated by the source laboratory; replacement "
+                "result will be transmitted in a subsequent file."
+            ),
+            key="void_reason",
+        )
+        if st.button("Void active result", key="btn_void_result"):
+            if not void_reason.strip():
+                st.error("A documented void reason is required.")
+            else:
+                try:
+                    void_result(conn, result_id, void_reason, user_name)
+                    st.success(
+                        f"Result #{result_id} has been voided. It remains traceable but is "
+                        "excluded from official exports."
+                    )
+                    st.rerun()
+                except (ValueError, sqlite3.Error) as exc:
+                    st.error(f"Result could not be voided: {exc}")
+
+    st.markdown("---")
+    st.subheader("Version history")
+    history = read_result_history(conn, result_id)
+    if history.empty:
+        st.info("No history found for the selected result.")
+    else:
+        cols = [
+            c for c in [
+                "result_id", "result_value", "result_unit", "status", "record_status",
+                "supersedes_result_id", "change_reason", "technical_validated_by",
+                "technical_validated_at", "biologist_validated_by", "biologist_validated_at",
+            ] if c in history.columns
+        ]
+        st.dataframe(history[cols], use_container_width=True, hide_index=True)
+
 def page_settings(conn, user_name):
     st.title("SETTINGS")
     st.caption("Customise the look and feel of the app for your business.")
@@ -1267,19 +1377,25 @@ def page_settings(conn, user_name):
 
 def page_automation(conn, user_name):
     st.title("AUTOMATION")
-    st.caption("Les relances sont livrées dans la Messagerie interne des destinataires "
-                "choisis ci-dessous — ça fonctionne réellement, sans avoir besoin d'un "
-                "vrai serveur e-mail. Un envoi SMTP réel est fait EN PLUS si vous configurez "
-                "un jour de vrais identifiants dans .streamlit/secrets.toml.")
+    st.caption(
+        "The free Streamlit deployment does not provide a persistent server-side scheduler. "
+        "This application therefore evaluates automation rules on page load and provides a controlled "
+        "manual/demo runner. All sends are recorded in AUTOMATION_RUNS and the Audit Trail."
+    )
 
     enabled = get_setting(conn, "automation_enabled", "1") == "1"
-    new_enabled = st.toggle("Enable automated reminders", value=enabled)
+    new_enabled = st.toggle("Enable automatic checks on application load", value=enabled)
 
     threshold = int(get_setting(conn, "reminder_ingestion_days", "7"))
-    new_threshold = st.number_input("Days before an 'ingestion overdue' reminder is sent",
-                                      min_value=1, max_value=60, value=threshold)
+    new_threshold = st.number_input("Days before an overdue weekly-ingestion reminder", min_value=1, max_value=60, value=threshold)
 
-    st.subheader("Destinataires")
+    vinc_day_setting = int(get_setting(conn, "vinc_reminder_day", "25"))
+    new_vinc_day = st.number_input(
+        "Monthly sponsor package due day", min_value=1, max_value=28, value=vinc_day_setting,
+        help="After this day, the monthly VINC package is due unless it has already been sent."
+    )
+
+    st.subheader("Recipients")
     account_rows = list_active_usernames(conn)
     account_options = {f"{fname} (@{uname})": uname for uname, fname, role in account_rows}
     label_by_username = {uname: label for label, uname in account_options.items()}
@@ -1288,26 +1404,20 @@ def page_automation(conn, user_name):
         raw = (get_setting(conn, setting_key, "") or "").split(",")
         return [label_by_username[u.strip()] for u in raw if u.strip() in label_by_username]
 
-    lab_labels = st.multiselect("Relance import hebdomadaire en retard",
-                                  list(account_options.keys()), default=_preselect("notify_emails_lab"))
-    sponsor_labels = st.multiselect("Relance extrait VINC mensuel",
-                                      list(account_options.keys()), default=_preselect("notify_emails_sponsor"))
-    critical_labels = st.multiselect("Alerte valeurs critiques",
-                                       list(account_options.keys()), default=_preselect("notify_emails_critical"))
+    lab_labels = st.multiselect("Weekly central laboratory overdue reminder", list(account_options.keys()), default=_preselect("notify_emails_lab"))
+    sponsor_labels = st.multiselect("Monthly VINC package recipient(s)", list(account_options.keys()), default=_preselect("notify_emails_sponsor"))
+    critical_labels = st.multiselect("Critical result alert recipient(s)", list(account_options.keys()), default=_preselect("notify_emails_critical"))
 
-    st.markdown("---")
-    st.subheader("Diffusion automatique des comptes rendus")
-    st.caption("Livré dans la Messagerie interne du destinataire, avec le PDF en pièce jointe. "
-                "⚠️ Ce n'est pas une messagerie de santé sécurisée MSSanté — voir README.")
+    st.subheader("Automatic patient reports")
+    st.caption("After biological signature, selected recipients can receive a PDF report through the internal mailbox. SMTP is optional.")
     auto_send_enabled = get_setting(conn, "auto_send_reports_enabled", "0") == "1"
-    new_auto_send = st.toggle("Envoyer automatiquement le compte rendu après signature biologique",
-                                value=auto_send_enabled)
-    physician_labels = st.multiselect("Destinataires des comptes rendus",
-                                        list(account_options.keys()), default=_preselect("notify_emails_physician"))
+    new_auto_send = st.toggle("Automatically send a patient PDF report after biological signature", value=auto_send_enabled)
+    physician_labels = st.multiselect("Patient report recipients", list(account_options.keys()), default=_preselect("notify_emails_physician"))
 
     if st.button("Save automation settings"):
         set_setting(conn, "automation_enabled", "1" if new_enabled else "0")
         set_setting(conn, "reminder_ingestion_days", str(new_threshold))
+        set_setting(conn, "vinc_reminder_day", str(new_vinc_day))
         set_setting(conn, "notify_emails_lab", ",".join(account_options[l] for l in lab_labels))
         set_setting(conn, "notify_emails_sponsor", ",".join(account_options[l] for l in sponsor_labels))
         set_setting(conn, "notify_emails_critical", ",".join(account_options[l] for l in critical_labels))
@@ -1318,26 +1428,98 @@ def page_automation(conn, user_name):
         st.rerun()
 
     st.markdown("---")
-    st.subheader("🔍 Aperçu (sans rien envoyer)")
-    st.caption("Montre ce qui se déclencherait MAINTENANT, avec vos données actuelles.")
-    if st.button("Générer l'aperçu"):
-        preview = preview_automation(conn)
-        for item in preview:
-            icon = "🔔" if item["would_trigger"] else "✅"
-            with st.container(border=True):
-                st.markdown(f"{icon} **{item['title']}**")
-                st.caption(item["detail"])
-                if item["would_trigger"]:
-                    recipients = [r.strip() for r in item["recipients"] if r.strip()]
-                    if recipients:
-                        st.write(f"→ Serait livré dans la messagerie de : {', '.join(recipients)}")
-                    else:
-                        st.write("→ Se déclencherait, mais aucun destinataire n'est configuré ci-dessus.")
+    st.subheader("🎬 Guided demonstration mode")
+    st.caption("Use this mode during the presentation. It uses a demo clock, so you do not need to wait until the 25th of a real month.")
+    if st.button("🪄 Apply recommended demo configuration"):
+        set_setting(conn, "automation_enabled", "1")
+        set_setting(conn, "automation_demo_mode", "1")
+        set_setting(conn, "automation_demo_date", "2026-06-25")
+        set_setting(conn, "automation_demo_last_ingestion_date", "2026-06-18")
+        set_setting(conn, "reminder_ingestion_days", "7")
+        set_setting(conn, "vinc_reminder_day", "25")
+        set_setting(conn, "notify_emails_lab", "lab_tech1")
+        set_setting(conn, "notify_emails_sponsor", "sponsor_lph")
+        set_setting(conn, "notify_emails_critical", "biologist1")
+        log_audit(conn, "SETTINGS", "APPLY_DEMO_AUTOMATION_CONFIG", user_name,
+                  comment="Recommended classroom automation configuration applied.")
+        st.success("Recommended automation demo configuration applied.")
+        st.rerun()
+    demo_mode = get_setting(conn, "automation_demo_mode", "0") == "1"
+    demo_mode_new = st.toggle("Enable demo clock", value=demo_mode)
+    demo_date_raw = get_setting(conn, "automation_demo_date", "2026-06-25")
+    try:
+        demo_default = date.fromisoformat(demo_date_raw)
+    except ValueError:
+        demo_default = date(2026, 6, 25)
+    demo_date_new = st.date_input("Demo reference date", value=demo_default, key="automation_demo_date_picker")
+    demo_ing_raw = get_setting(conn, "automation_demo_last_ingestion_date", "2026-06-18")
+    try:
+        demo_ing_default = date.fromisoformat(demo_ing_raw)
+    except ValueError:
+        demo_ing_default = date(2026, 6, 18)
+    demo_ing_new = st.date_input("Demo last-ingestion date", value=demo_ing_default, key="automation_demo_ingestion_picker")
+    if st.button("Save demo clock"):
+        set_setting(conn, "automation_demo_mode", "1" if demo_mode_new else "0")
+        set_setting(conn, "automation_demo_date", demo_date_new.isoformat())
+        set_setting(conn, "automation_demo_last_ingestion_date", demo_ing_new.isoformat())
+        log_audit(conn, "SETTINGS", "UPDATE_AUTOMATION_DEMO_CLOCK", user_name,
+                  comment=f"demo_mode={demo_mode_new}; reference={demo_date_new}; last_ingestion={demo_ing_new}")
+        st.success("Demo clock saved.")
+        st.rerun()
+
+    st.info(
+        "Recommended presentation setup: Demo clock ON, reference date 2026-06-25, last ingestion date 2026-06-18, "
+        "sponsor recipient = sponsor_lph. Then preview, run the automation, and open the sponsor Mailbox to show the ZIP attachment."
+    )
 
     st.markdown("---")
-    st.caption("Limite connue : les relances sont vérifiées à chaque chargement de page (pas de "
-                "vrai cron serveur sur le tier gratuit Streamlit) — mais la livraison en "
-                "messagerie interne, elle, fonctionne réellement dès qu'une page est ouverte.")
+    st.subheader("🔍 Preview")
+    preview = preview_automation(conn)
+    for item in preview:
+        icon = "🔔" if item["would_trigger"] else "✅"
+        with st.container(border=True):
+            st.markdown(f"{icon} **{item['title']}**")
+            st.caption(item["detail"])
+            recipients = [r.strip() for r in item["recipients"] if r.strip()]
+            if recipients:
+                st.write("Recipients:", ", ".join(recipients))
+
+    col_run, col_normal = st.columns(2)
+    with col_run:
+        if st.button("▶ Run automation now", type="primary"):
+            run_id, results = run_automation_now(conn, triggered_by=user_name, force=False)
+            st.success(f"Automation run {run_id} completed.")
+            for r in results:
+                st.write(f"**{r['job']}** — triggered={r.get('triggered')} — sent={r.get('sent',0)} — {r.get('detail','')}")
+    with col_normal:
+        if st.button("🎬 Run controlled demo (force monthly send)"):
+            run_id, results = run_automation_now(conn, triggered_by=user_name, force=True)
+            st.success(f"Controlled demo run {run_id} completed.")
+            for r in results:
+                st.write(f"**{r['job']}** — triggered={r.get('triggered')} — sent={r.get('sent',0)}")
+            st.warning("Force mode is for the classroom demonstration only. Data eligibility rules are never bypassed.")
+
+    st.markdown("---")
+    st.subheader("Recent automation runs")
+    from db import list_recent_automation_runs
+    runs_df = list_recent_automation_runs(conn)
+    if runs_df.empty:
+        st.info("No automation run has been recorded yet.")
+    else:
+        st.dataframe(runs_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("📅 Contractual cadence monitoring")
+    st.caption("The laboratory sends files weekly to the CRO; the CRO sends the VINC package monthly to the sponsor. The tables below are based on recorded audit events.")
+    col_week, col_month = st.columns(2)
+    with col_week:
+        st.markdown("**Weekly cadence — Central Laboratory → CRO**")
+        weekly_df = get_weekly_ingestion_compliance(conn)
+        st.dataframe(weekly_df, use_container_width=True, hide_index=True)
+    with col_month:
+        st.markdown("**Monthly cadence — CRO → Sponsor**")
+        monthly_df = get_monthly_vinc_compliance(conn)
+        st.dataframe(monthly_df, use_container_width=True, hide_index=True)
 
 
 def page_audit_trail(conn):
@@ -1354,50 +1536,81 @@ def page_audit_trail(conn):
 
 
 def page_extraction_vinc(conn, user_name, role):
-    st.title("RESULTS OF THE VINC VISIT")
+    st.title("VINC VISIT RESULTS")
     render_sponsor_reminder(conn)
     df = read_full_results(conn)
-    vinc_df_all = df[df["visit_code"] == "VINC"]
-    if vinc_df_all.empty:
+    all_vinc = df[df["visit_code"] == "VINC"].copy()
+    if all_vinc.empty:
         st.info("No VINC results are available at present.")
         return
 
-    vinc_df = filter_reviewed_only(vinc_df_all)
-    n_excluded = len(vinc_df_all) - len(vinc_df)
-    if n_excluded > 0:
-        st.warning(f"⚠️ {n_excluded} VINC result(s) are not yet biologically validated "
-                   "(status PENDING or TECHNICAL_OK) and have been excluded from this "
-                   "extract. Contact the biologist to finalize validation before the "
-                   "monthly export — see risk #1 of the risk analysis.")
-    if vinc_df.empty:
-        st.info("No biologically validated (REVIEWED) VINC results are available yet.")
+    all_vinc = compute_oor_flag(all_vinc)
+    st.subheader("VINC results — operational view")
+    st.dataframe(all_vinc, use_container_width=True)
+
+    cutoff_date = st.date_input(
+        "Explicit monthly cut-off date", value=date.today(), key="vinc_cutoff_date",
+        help="Only VINC results dated on/before the cut-off and in status REVIEWED are eligible for the official export."
+    )
+    eligible_vinc = select_vinc_for_export(all_vinc, cutoff_date)
+    pending = all_vinc[(pd.to_datetime(all_vinc["visit_date"], errors="coerce").dt.date <= cutoff_date) & (all_vinc["status"] != "REVIEWED")]
+
+    col1, col2 = st.columns(2)
+    col1.metric("VINC records in scope", len(eligible_vinc))
+    col2.metric("VINC records blocked", len(pending))
+    if not pending.empty:
+        st.warning(
+            f"{len(pending)} VINC result(s) are excluded from the official package because they are not REVIEWED. "
+            "The operational view remains visible for follow-up."
+        )
+
+    if eligible_vinc.empty:
+        st.info("No REVIEWED VINC result is eligible for export at this cut-off.")
         return
 
-    vinc_df = compute_oor_flag(vinc_df)
-    st.dataframe(vinc_df, use_container_width=True)
+    package = build_vinc_package(eligible_vinc, cutoff_date, user_name)
+    st.success(
+        f"Export package ready: {package['row_count']} reviewed VINC record(s). "
+        f"Package SHA-256: {package['package_sha256']}"
+    )
 
-    export_df = vinc_df[["usubjid", "site_id", "visit_code", "visit_date",
-                          "test_code", "test_name", "result_value", "result_unit", "result_date"]]
-    csv_buffer = io.StringIO()
-    export_df.to_csv(csv_buffer, index=False)
-    filename = f"extraction_VINC_{date.today()}.csv"
+    # Keep the package ledger in the database only when the user is allowed to generate it.
+    package_registered = conn.execute(
+        "SELECT 1 FROM EXPORT_PACKAGES WHERE package_id = ?", (package["package_id"],)
+    ).fetchone()
+    if package_registered is None:
+        from db import register_export_package
+        register_export_package(
+            conn, package["package_id"], "VINC_MONTHLY_CRO_TO_SPONSOR", user_name,
+            cutoff_date, package["row_count"], package["csv_sha256"], package["package_sha256"],
+            package["filename"]
+        )
 
-    col_csv, col_pdf = st.columns(2)
-    with col_csv:
-        if st.download_button("⬇️ Download the VINC extract (CSV)", csv_buffer.getvalue(), file_name=filename):
-            action = "CONSULTATION_VINC_SPONSOR" if role == "SPONSOR" else "EXPORT_VINC_CRO"
-            log_audit(conn, "LAB_RESULTS", action, user_name, comment=f"{len(export_df)} lignes")
-    with col_pdf:
-        pdf_bytes = generate_vinc_pdf_report(conn, vinc_df, user_name)
-        pdf_filename = f"VINC_report_{date.today()}.pdf"
-        if st.download_button("📄 Download the VINC report (PDF)", pdf_bytes,
-                                file_name=pdf_filename, mime="application/pdf"):
-            action = "EXPORT_PDF_VINC_SPONSOR" if role == "SPONSOR" else "EXPORT_PDF_VINC_CRO"
-            log_audit(conn, "LAB_RESULTS", action, user_name, comment=f"{len(vinc_df)} lignes, {pdf_filename}")
+    if st.download_button(
+        "⬇️ Download official VINC package (ZIP)", package["package_bytes"],
+        file_name=package["filename"], mime="application/zip", key="dl_vinc_package"
+    ):
+        from db import mark_export_package_downloaded
+        mark_export_package_downloaded(conn, package["package_id"], user_name)
+        action = "CONSULTATION_VINC_SPONSOR" if role == "SPONSOR" else "EXPORT_VINC_CRO"
+        log_audit(
+            conn, "EXPORT_PACKAGES", action, user_name, record_ref=package["package_id"],
+            comment=f"cutoff={cutoff_date}; rows={package['row_count']}; sha256={package['package_sha256']}"
+        )
+
+    pdf_bytes = generate_vinc_pdf_report(conn, eligible_vinc, user_name)
+    if st.download_button(
+        "📄 Download reviewed VINC PDF", pdf_bytes,
+        file_name=f"BLOOD_VINC_{cutoff_date}.pdf", mime="application/pdf", key="dl_vinc_pdf"
+    ):
+        log_audit(
+            conn, "EXPORT_PACKAGES", "EXPORT_PDF_VINC_SPONSOR" if role == "SPONSOR" else "EXPORT_PDF_VINC_CRO",
+            user_name, record_ref=package["package_id"], comment=f"rows={package['row_count']}"
+        )
 
 
 def page_remarks(conn, user_name, role):
-    st.title("COMMENT ON THE RESULTS")
+    st.title("RESULT COMMENTS")
     df = read_full_results(conn)
 
     if role in ("BIOLOGIST", "PHYSICIAN", "CRO"):
@@ -1440,12 +1653,15 @@ def main():
     if handle_password_reset_flow(conn):
         return
 
+    # The automation engine runs before authentication so a simple HTTP wake-up
+    # from GitHub Actions can trigger the deterministic automation jobs even when
+    # the Streamlit Community Cloud app has been sleeping. No user data is shown.
+    check_and_send_reminders(conn)
+
     username, role, full_name = sidebar_user_identification(conn)
     if not username or role is None:
         render_landing_page(conn)
         return
-
-    check_and_send_reminders(conn)
 
     notif_count = None
     if role == "LAB_TECH":
@@ -1462,7 +1678,7 @@ def main():
 
     def _format_page_label(p):
         label = f"{PAGE_ICONS.get(p, '')} {p}"
-        if p == "Messagerie" and unread:
+        if p == "Mailbox" and unread:
             label += f" ({unread})"
         return label
 
@@ -1510,13 +1726,15 @@ def main():
         page_automation(conn, username)
     elif page == "User Management":
         page_user_management(conn, username)
+    elif page == "Data Correction / Void":
+        page_data_correction(conn, username)
     elif page == "Audit Trail":
         page_audit_trail(conn)
     elif page == "Guide":
         page_guide(role)
-    elif page == "Messagerie":
+    elif page == "Mailbox":
         page_messagerie(conn, username)
-    elif page == "Mon Compte":
+    elif page == "My Account":
         page_mon_compte(conn, username, role, full_name)
 
 

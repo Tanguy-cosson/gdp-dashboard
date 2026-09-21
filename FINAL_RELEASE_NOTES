@@ -1,0 +1,32 @@
+BLOOD LIMS — Final demonstration release
+Release: V12 Final Demo / GxP-oriented prototype  
+Prepared: 2026-09-21
+Scope
+This release is frozen as the final classroom/demo version of the BLOOD LIMS Streamlit application. The UI is English-only to keep the workflow consistent and reduce the risk of partial translations.
+Main controls included
+CSV and HL7 v2 ORU^R01 file-based ingestion
+Pre-validation before database write
+Atomic batch import and source SHA-256
+Import ledger and idempotent re-import protection
+Technical validation followed by biological validation
+Re-authenticated electronic signature
+Critical / out-of-range classification
+Controlled correction and void with supersession
+Field-level audit metadata (old value, new value, reason, actor, timestamp)
+Active-record-only exports after correction/supersession
+Monthly VINC export restricted to REVIEWED + ACTIVE + cut-off
+Package manifest and SHA-256
+Internal mailbox delivery for free-tier demonstration
+Weekly reminder, monthly VINC job, critical alert job
+Anti-duplicate guards and automation run ledger
+Optional patient PDF reporting after biological signature
+SDTM LB/DM starter export and Define-XML starter
+GitHub Actions CI for automated tests
+Free Streamlit constraint
+The application deliberately does not depend on a permanent server-side scheduler. Automation is evaluated on app load/wake and through a manual deterministic runner. This is a demonstration architecture, not a production-grade scheduled execution service.
+Verification performed in the build environment
+Fresh final schema execution: PASS
+V10 → final migration: PASS
+Automated regression suite with a temporary Streamlit test stub: 78/78 PASS
+Supplied CSV end-to-end integration: PASS (45 imported records, 15 VINC eligible after review, monthly package delivered to sponsor internal mailbox, manifest and hashes created)
+The 78-test result validates the tested Python business logic. It is not a claim of IQ/OQ/PQ or production qualification of Streamlit Community Cloud.

@@ -1,0 +1,66 @@
+"""Tests du suivi de conformité hebdomadaire/mensuel (automation.py) —
+matérialise l'exigence contractuelle : laboratoire central -> CRO
+CHAQUE SEMAINE, CRO -> promoteur CHAQUE MOIS."""
+import sqlite3
+
+import pytest
+
+import db as dbmod
+from audit import log_audit
+from automation import get_monthly_vinc_compliance, get_weekly_ingestion_compliance
+from migrations import run_migrations
+
+
+@pytest.fixture
+def db_conn(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(dbmod, "DB_PATH", str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    with open(dbmod.SCHEMA_PATH, "r", encoding="utf-8") as f:
+        conn.executescript(f.read())
+    conn.commit()
+    run_migrations(conn)
+    yield conn
+    conn.close()
+
+
+def test_current_week_marked_compliant_after_ingestion(db_conn):
+    log_audit(db_conn, "LAB_RESULTS", "INGESTION_CSV", "lab_tech1")
+    weekly = get_weekly_ingestion_compliance(db_conn, n_weeks=4)
+    assert weekly.iloc[-1]["File received"] == "✅"
+
+
+def test_weeks_without_ingestion_marked_missing(db_conn):
+    log_audit(db_conn, "LAB_RESULTS", "INGESTION_CSV", "lab_tech1")
+    weekly = get_weekly_ingestion_compliance(db_conn, n_weeks=4)
+    # Les 3 semaines precedentes n'ont aucun import enregistre
+    assert (weekly.iloc[:-1]["File received"] == "❌").all()
+
+
+def test_hl7_ingestion_also_counts(db_conn):
+    log_audit(db_conn, "LAB_RESULTS", "INGESTION_HL7", "lab_tech1")
+    weekly = get_weekly_ingestion_compliance(db_conn, n_weeks=1)
+    assert weekly.iloc[-1]["File received"] == "✅"
+
+
+def test_no_ingestion_at_all_marks_all_weeks_missing(db_conn):
+    weekly = get_weekly_ingestion_compliance(db_conn, n_weeks=4)
+    assert (weekly["File received"] == "❌").all()
+
+
+def test_current_month_marked_compliant_after_vinc_export(db_conn):
+    log_audit(db_conn, "LAB_RESULTS", "EXPORT_VINC_CRO", "cro_arc")
+    monthly = get_monthly_vinc_compliance(db_conn, n_months=3)
+    assert monthly.iloc[-1]["Package sent/consulted"] == "✅"
+
+
+def test_sponsor_consultation_also_counts(db_conn):
+    log_audit(db_conn, "LAB_RESULTS", "CONSULTATION_VINC_SPONSOR", "sponsor_lph")
+    monthly = get_monthly_vinc_compliance(db_conn, n_months=1)
+    assert monthly.iloc[-1]["Package sent/consulted"] == "✅"
+
+
+def test_no_vinc_action_marks_all_months_missing(db_conn):
+    monthly = get_monthly_vinc_compliance(db_conn, n_months=3)
+    assert (monthly["Package sent/consulted"] == "❌").all()

@@ -1,0 +1,29 @@
+"""Tests de compute_lbnrind : variable CDISC LBNRIND (NORMAL/HIGH/LOW)
+utilisée dans l'export SDTM domaine LB."""
+from business_logic import compute_lbnrind
+
+
+def test_value_in_range_is_normal():
+    assert compute_lbnrind(5.0, 4.0, 6.0) == "NORMAL"
+
+
+def test_value_above_range_is_high():
+    assert compute_lbnrind(7.0, 4.0, 6.0) == "HIGH"
+
+
+def test_value_below_range_is_low():
+    assert compute_lbnrind(2.0, 4.0, 6.0) == "LOW"
+
+
+def test_value_at_exact_boundary_is_normal():
+    assert compute_lbnrind(4.0, 4.0, 6.0) == "NORMAL"
+    assert compute_lbnrind(6.0, 4.0, 6.0) == "NORMAL"
+
+
+def test_missing_value_returns_empty_string():
+    assert compute_lbnrind(None, 4.0, 6.0) == ""
+
+
+def test_missing_reference_range_returns_empty_string():
+    assert compute_lbnrind(5.0, None, 6.0) == ""
+    assert compute_lbnrind(5.0, 4.0, None) == ""

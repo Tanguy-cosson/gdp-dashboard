@@ -1,24 +1,7 @@
-"""
-migrations.py — Migrations de schéma versionnées et idempotentes.
+"""Versioned, idempotent database migrations for the BLOOD LIMS demo.
 
-Contexte : une base créée par une ancienne version de schema.sql (avant
-l'ajout de la gestion des utilisateurs) n'a pas les colonnes
-USERS.active / failed_login_count / locked_until / must_change_password
-ni la table PASSWORD_RESET_TOKENS. `CREATE TABLE IF NOT EXISTS` dans
-schema.sql ne les ajoutera jamais à une table qui existe déjà.
-
-Principe volontairement robuste : chaque migration se vérifie elle-même
-par INTROSPECTION du schéma réel (ex: "la colonne USERS.active
-existe-t-elle ?"), PAS en se fiant uniquement à un compteur de version
-stocké dans SETTINGS. Un compteur seul peut mentir (ex: une valeur par
-défaut insérée par erreur ferait croire qu'une base ancienne est déjà
-à jour). schema_version n'est donc mis à jour qu'APRÈS coup, comme
-trace/audit — jamais comme condition d'exécution.
-
-C'est l'inverse volontaire de l'ancien pattern
-'ALTER TABLE ... ; except: pass' exécuté à chaque page : ici c'est
-tracé, appliqué au plus une fois par base (grâce à l'introspection),
-et audité.
+The migration layer is deliberately explicit: each migration inspects the real
+schema before making a change and writes an audit event after success.
 """
 from audit import log_audit
 from db import set_setting
@@ -34,31 +17,30 @@ def _table_exists(conn, table):
     return cur.fetchone() is not None
 
 
+def _add_column(conn, table, column_def):
+    name = column_def.split()[0]
+    if not _column_exists(conn, table, name):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+
+
 def _migration_1_user_management(conn):
-    """Ajoute la gestion de compte (verrouillage, désactivation,
-    changement forcé) et la table des jetons de réinitialisation."""
-    if not _column_exists(conn, "USERS", "active"):
-        conn.execute("ALTER TABLE USERS ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-    if not _column_exists(conn, "USERS", "failed_login_count"):
-        conn.execute("ALTER TABLE USERS ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0")
-    if not _column_exists(conn, "USERS", "locked_until"):
-        conn.execute("ALTER TABLE USERS ADD COLUMN locked_until TEXT")
-    if not _column_exists(conn, "USERS", "must_change_password"):
-        conn.execute("ALTER TABLE USERS ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
-    if not _column_exists(conn, "USERS", "created_at"):
-        # SQLite interdit un DEFAULT non constant dans ALTER TABLE ADD COLUMN
-        # (ex: datetime('now')) -> on ajoute la colonne nue, puis on
-        # rétro-remplit les lignes existantes en une passe.
-        conn.execute("ALTER TABLE USERS ADD COLUMN created_at TEXT")
-        conn.execute("UPDATE USERS SET created_at = datetime('now') WHERE created_at IS NULL")
+    for definition in [
+        "active INTEGER NOT NULL DEFAULT 1",
+        "failed_login_count INTEGER NOT NULL DEFAULT 0",
+        "locked_until TEXT",
+        "must_change_password INTEGER NOT NULL DEFAULT 0",
+        "created_at TEXT",
+    ]:
+        _add_column(conn, "USERS", definition)
+    conn.execute("UPDATE USERS SET created_at = datetime('now') WHERE created_at IS NULL")
     if not _table_exists(conn, "PASSWORD_RESET_TOKENS"):
         conn.execute("""
             CREATE TABLE PASSWORD_RESET_TOKENS (
-                token       TEXT PRIMARY KEY,
-                username     TEXT NOT NULL,
-                created_at     TEXT DEFAULT (datetime('now')),
-                expires_at       TEXT NOT NULL,
-                used_at             TEXT,
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
                 FOREIGN KEY (username) REFERENCES USERS(username)
             )
         """)
@@ -66,22 +48,18 @@ def _migration_1_user_management(conn):
 
 
 def _migration_2_gdpr_and_hl7(conn):
-    """Ajoute les champs de pseudonymisation RGPD sur PATIENTS et la
-    table CONSENT."""
-    if not _column_exists(conn, "PATIENTS", "anonymized"):
-        conn.execute("ALTER TABLE PATIENTS ADD COLUMN anonymized INTEGER NOT NULL DEFAULT 0")
-    if not _column_exists(conn, "PATIENTS", "anonymized_at"):
-        conn.execute("ALTER TABLE PATIENTS ADD COLUMN anonymized_at TEXT")
+    _add_column(conn, "PATIENTS", "anonymized INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "PATIENTS", "anonymized_at TEXT")
     if not _table_exists(conn, "CONSENT"):
         conn.execute("""
             CREATE TABLE CONSENT (
-                consent_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_id       TEXT NOT NULL,
-                usubjid           TEXT NOT NULL,
-                status             TEXT NOT NULL,
-                document_ref         TEXT,
-                recorded_by            TEXT NOT NULL,
-                recorded_at              TEXT DEFAULT (datetime('now')),
+                consent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id TEXT NOT NULL,
+                usubjid TEXT NOT NULL,
+                status TEXT NOT NULL,
+                document_ref TEXT,
+                recorded_by TEXT NOT NULL,
+                recorded_at TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (patient_id) REFERENCES PATIENTS(patient_id)
             )
         """)
@@ -89,24 +67,21 @@ def _migration_2_gdpr_and_hl7(conn):
 
 
 def _migration_3_internal_mailbox(conn):
-    """Ajoute la messagerie interne (voir mailbox.py) et le champ
-    'poste' sur les utilisateurs, pour l'espace Mon Compte."""
-    if not _column_exists(conn, "USERS", "job_title"):
-        conn.execute("ALTER TABLE USERS ADD COLUMN job_title TEXT")
+    _add_column(conn, "USERS", "job_title TEXT")
     if not _table_exists(conn, "MESSAGES"):
         conn.execute("""
             CREATE TABLE MESSAGES (
-                message_id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                recipient_username     TEXT NOT NULL,
-                sender_username           TEXT,
-                sender_label                 TEXT NOT NULL,
-                subject                         TEXT NOT NULL,
-                body                               TEXT NOT NULL,
-                attachment_name                      TEXT,
-                attachment_data                         BLOB,
-                attachment_mimetype                        TEXT,
-                is_read                                       INTEGER NOT NULL DEFAULT 0,
-                created_at                                       TEXT DEFAULT (datetime('now')),
+                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_username TEXT NOT NULL,
+                sender_username TEXT,
+                sender_label TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                attachment_name TEXT,
+                attachment_data BLOB,
+                attachment_mimetype TEXT,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY (recipient_username) REFERENCES USERS(username)
             )
         """)
@@ -114,62 +89,163 @@ def _migration_3_internal_mailbox(conn):
 
 
 def _migration_4_audit_record_ref(conn):
-    """Ajoute AUDIT_TRAIL.record_ref — présente dans schema.sql depuis
-    le début de nos échanges, mais jamais migrée pour les bases créées
-    avant cet ajout (c'est ce qui a provoqué l'erreur 'no column named
-    record_ref' en production)."""
-    if not _column_exists(conn, "AUDIT_TRAIL", "record_ref"):
-        conn.execute("ALTER TABLE AUDIT_TRAIL ADD COLUMN record_ref TEXT")
+    _add_column(conn, "AUDIT_TRAIL", "record_ref TEXT")
     conn.commit()
 
 
-# (version, nom, fonction). Toujours ajouter en fin de liste, ne
-# jamais modifier une migration déjà publiée — en écrire une nouvelle
-# à la place si un correctif est nécessaire.
+def _migration_5_gxp_traceability(conn):
+    """Adds result lineage, field-level audit metadata and automation/export ledgers."""
+    if _table_exists(conn, "LAB_RESULTS"):
+        for definition in [
+            "record_status TEXT NOT NULL DEFAULT 'ACTIVE'",
+            "supersedes_result_id INTEGER",
+            "change_reason TEXT",
+            "import_batch_id TEXT",
+        ]:
+            _add_column(conn, "LAB_RESULTS", definition)
+
+    for definition in [
+        "old_value TEXT",
+        "new_value TEXT",
+        "change_reason TEXT",
+        "object_type TEXT",
+        "object_id TEXT",
+    ]:
+        _add_column(conn, "AUDIT_TRAIL", definition)
+
+    if not _table_exists(conn, "E_SIGNATURES"):
+        conn.execute("""
+            CREATE TABLE E_SIGNATURES (
+                signature_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                result_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                meaning TEXT NOT NULL,
+                signed_at TEXT NOT NULL,
+                auth_method TEXT NOT NULL DEFAULT 'PASSWORD_REAUTH',
+                signature_hash TEXT NOT NULL,
+                FOREIGN KEY (result_id) REFERENCES LAB_RESULTS(result_id)
+            )
+        """)
+
+    if not _table_exists(conn, "AUTOMATION_RUNS"):
+        conn.execute("""
+            CREATE TABLE AUTOMATION_RUNS (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                triggered_by TEXT NOT NULL,
+                reference_date TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                details TEXT
+            )
+        """)
+
+    if not _table_exists(conn, "EXPORT_PACKAGES"):
+        conn.execute("""
+            CREATE TABLE EXPORT_PACKAGES (
+                package_id TEXT PRIMARY KEY,
+                package_type TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                generated_by TEXT NOT NULL,
+                cutoff_date TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                csv_sha256 TEXT NOT NULL,
+                package_sha256 TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'GENERATED' CHECK (status IN ('GENERATED','DOWNLOADED','SENT','FAILED')),
+                sent_at TEXT,
+                sent_by TEXT,
+                delivery_reference TEXT
+            )
+        """)
+    else:
+        sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='EXPORT_PACKAGES'").fetchone()
+        sql = (sql_row[0] or "") if sql_row else ""
+        if "'SENT'" not in sql:
+            conn.execute("ALTER TABLE EXPORT_PACKAGES RENAME TO EXPORT_PACKAGES_OLD")
+            conn.execute("""
+                CREATE TABLE EXPORT_PACKAGES (
+                    package_id TEXT PRIMARY KEY,
+                    package_type TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    generated_by TEXT NOT NULL,
+                    cutoff_date TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    csv_sha256 TEXT NOT NULL,
+                    package_sha256 TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'GENERATED' CHECK (status IN ('GENERATED','DOWNLOADED','SENT','FAILED')),
+                    sent_at TEXT,
+                    sent_by TEXT,
+                    delivery_reference TEXT
+                )
+            """)
+            conn.execute("""
+                INSERT INTO EXPORT_PACKAGES (package_id, package_type, generated_at, generated_by, cutoff_date,
+                    row_count, csv_sha256, package_sha256, filename, status)
+                SELECT package_id, package_type, generated_at, generated_by, cutoff_date, row_count,
+                    csv_sha256, package_sha256, filename, status FROM EXPORT_PACKAGES_OLD
+            """)
+            conn.execute("DROP TABLE EXPORT_PACKAGES_OLD")
+
+    for key, value in [
+        ("automation_demo_mode", "0"),
+        ("automation_demo_date", "2026-06-25"),
+        ("automation_demo_last_ingestion_date", "2026-06-18"),
+        ("automation_last_run_id", ""),
+        ("last_vinc_sent_period", ""),
+        ("last_weekly_reminder_period", ""),
+        ("last_critical_alert_signature", ""),
+    ]:
+        conn.execute(
+            "INSERT OR IGNORE INTO SETTINGS(setting_key, setting_value) VALUES (?, ?)",
+            (key, value),
+        )
+    conn.commit()
+
+
+
+def _migration_6_english_demo_labels(conn):
+    """Translate the built-in demonstration account labels without touching custom user names."""
+    replacements = {
+        ("lab_tech1", "Technicien de laboratoire", "Laboratory Technician"),
+        ("biologist1", "Dr. Biologiste", "Dr. Biologist"),
+        ("physician1", "Dr. Medecin Investigateur", "Dr. Investigator"),
+        ("sponsor_lph", "Promoteur LPH", "LPH Sponsor"),
+        ("cro_arc", "ARC - Clinical Services", "CRO - Clinical Services"),
+    }
+    for username, old_name, new_name in replacements:
+        conn.execute("UPDATE USERS SET full_name=? WHERE username=? AND full_name=?", (new_name, username, old_name))
+    conn.commit()
+
+
 MIGRATIONS = [
     (1, "user_management_and_password_reset", _migration_1_user_management),
     (2, "gdpr_and_hl7", _migration_2_gdpr_and_hl7),
     (3, "internal_mailbox", _migration_3_internal_mailbox),
     (4, "audit_record_ref", _migration_4_audit_record_ref),
+    (5, "gxp_traceability_and_automation", _migration_5_gxp_traceability),
+    (6, "english_demo_labels", _migration_6_english_demo_labels),
 ]
 
 
 def run_migrations(conn):
-    """Applique chaque migration (elles sont idempotentes en interne :
-    rejouer une migration déjà appliquée ne fait rien, grâce à
-    l'introspection). schema_version est mis à jour après coup, à titre
-    de trace uniquement — il ne conditionne jamais l'exécution.
-
-    IMPORTANT — ordre d'exécution : la migration 4 (AUDIT_TRAIL.record_ref)
-    doit TOUJOURS s'exécuter en premier, avant toute autre migration,
-    quel que soit son numéro. Raison : chaque migration se termine par
-    un appel à log_audit(), qui écrit désormais dans record_ref. Sur une
-    base vraiment ancienne qui n'a ni les colonnes USERS ni record_ref,
-    exécuter la migration 1 en premier ferait planter son propre
-    log_audit() final sur une colonne qui n'existe pas encore — un
-    problème d'œuf et de poule découvert grâce aux tests (voir
-    tests/test_migrations.py)."""
-    was_missing_4 = not _column_exists(conn, "AUDIT_TRAIL", "record_ref")
+    # record_ref must exist before any migration writes an audit event.
     _migration_4_audit_record_ref(conn)
-
     checks = {
         1: lambda: not _column_exists(conn, "USERS", "active"),
         2: lambda: not _column_exists(conn, "PATIENTS", "anonymized"),
         3: lambda: not _column_exists(conn, "USERS", "job_title"),
+        5: lambda: not _column_exists(conn, "LAB_RESULTS", "record_status"),
+        6: lambda: any(r[0] in ("Technicien de laboratoire", "Dr. Biologiste", "Dr. Medecin Investigateur", "Promoteur LPH") for r in conn.execute("SELECT full_name FROM USERS WHERE username IN ('lab_tech1','biologist1','physician1','sponsor_lph')").fetchall()),
     }
-    for version, name, migration_fn in MIGRATIONS:
+    for version, name, fn in MIGRATIONS:
         if version == 4:
-            continue  # déjà appliquée ci-dessus, avant tout le reste
-
+            continue
         was_missing = checks.get(version, lambda: True)()
-
-        migration_fn(conn)
-
+        fn(conn)
         if was_missing:
             log_audit(conn, "SCHEMA", "MIGRATION_APPLIED", "system", comment=f"v{version}: {name}")
-
         set_setting(conn, "schema_version", str(version))
-
-    if was_missing_4:
-        log_audit(conn, "SCHEMA", "MIGRATION_APPLIED", "system", comment="v4: audit_record_ref")
-    set_setting(conn, "schema_version", "4")
+    set_setting(conn, "schema_version", "6")

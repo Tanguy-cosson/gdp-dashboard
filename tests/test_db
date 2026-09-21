@@ -78,7 +78,7 @@ def test_mark_technical_validation_only_affects_pending(conn):
 
     # Rejouer sur un résultat déjà TECHNICAL_OK ne doit rien faire (garde WHERE status='PENDING')
     n2 = db.mark_technical_validation(conn, [result_id], "lab_tech1")
-    assert n2 == 1  # la fonction renvoie len(result_ids) même si 0 ligne réellement modifiée
+    assert n2 == 0  # no second transition: only PENDING records are changed
     status_after = conn.execute("SELECT status FROM LAB_RESULTS WHERE result_id = ?", (result_id,)).fetchone()[0]
     assert status_after == "TECHNICAL_OK"  # toujours TECHNICAL_OK, pas repassé par une autre valeur
 

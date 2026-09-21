@@ -1,114 +1,216 @@
 BLOOD Study LIMS
-LIMS Streamlit pour la gestion des résultats de bilan sanguin dans un essai clinique diabète (workflow CDISC SDTM).
-État du projet
-Domaine	Statut
-Workflow métier (ingestion → validation → export)	✅ Fait
-Sécurité des comptes (verrouillage, désactivation, mdp oublié)	✅ Fait
-Code-barres (émission + lecture USB/caméra)	✅ Fait
-Import HL7 v2 (ORU^R01)	✅ Fait — voir limite ci-dessous (pas d'écoute réseau temps réel)
-Messagerie interne + espace "Mon Compte"	✅ Fait — relances et comptes rendus livrés réellement, sans SMTP
-Automatisation (relances, diffusion auto des comptes rendus)	✅ Fait
-RGPD (export, pseudonymisation, consentement)	✅ Fait — voir limite ci-dessous (ne remplace pas HDS)
-Export CDISC (LB, DM, define.xml starter)	✅ Fait (starter, à compléter avant dépôt réel)
-Visualisation du workflow (schéma live + frise par patient)	✅ Fait
-Carte de stockage des échantillons	✅ Fait
-Documentation de validation (IQ/OQ/PQ)	✅ Modèle fourni (`CSV_Protocol_BLOOD_LIMS.docx`)
-Tests automatisés + CI	✅ Fait (57 tests, GitHub Actions)
-Données de démo	✅ Fait (`seed_demo_data.py`)
-Logos / captures d'écran	⚠️ Logos placeholder fournis — remplacez-les par les vôtres
-PostgreSQL / haute disponibilité	⏳ Non fait, nécessite un compte externe (voir plus bas)
-Hébergement certifié HDS	⏳ Non fait — nécessaire pour de vraies données patients (voir plus bas)
-Arborescence
+Educational GxP-oriented LIMS prototype for the BLOOD clinical study
+This Streamlit application demonstrates a controlled data flow for a centralized laboratory sending blood results weekly to Clinical Services (CRO), with a monthly VINC package sent by the CRO to LPH (Sponsor).
+The study context is intentionally generic: adults with type 2 diabetes, with laboratory assessments at VINC, V1 and V2. No treatment arm, investigational product or randomization logic is required for the demonstration.
+> \*\*Important:\*\* this is a training/demo prototype. It is not a validated production GxP system and must not be used with real patient data.
+What is implemented
+Area	Final status
+CSV / HL7 v2 ORU^R01 ingestion	✅
+Pre-validation before write	✅
+Atomic CSV batch import	✅
+Source-file SHA-256 / import ledger	✅
+Patient / visit / sample traceability	✅
+Technical validation	✅
+Biological validation	✅
+Re-authenticated electronic signature	✅
+Critical / out-of-range detection	✅
+Controlled correction / void with supersession	✅
+Field-level audit metadata (old/new/reason)	✅
+Append-only audit trail	✅
+Internal mailbox with real in-app delivery	✅
+Weekly ingestion reminder	✅
+Monthly reviewed-VINC package	✅
+Package manifest + SHA-256	✅
+Automatic execution on app load / wake-up	✅
+Manual deterministic automation runner	✅
+SDTM LB / DM starter export	✅
+Define-XML starter	✅
+Demo mode with deterministic reference date	✅
+English user interface	✅
+Automatic tests + GitHub CI	✅
+Free-tier architecture
+```text
+Central Lab
+   |
+   | weekly CSV / HL7
+   v
+Streamlit Community Cloud
+   |
+   +--> pre-validation / atomic import
+   +--> technical validation
+   +--> biological validation + e-signature
+   +--> audit trail / corrections / alerts
+   +--> internal mailbox
+   |
+   +--> monthly VINC package (ACTIVE + REVIEWED + <= cut-off)
+   |
+   v
+LPH Sponsor mailbox
 ```
-gdp-dashboard/  (racine de votre repo)
-├── streamlit_app.py        # Point d'entrée Streamlit, pages
-├── db.py                   # Connexion SQLite + CRUD
-├── auth.py                 # Authentification, verrouillage, mdp oublié
-├── audit.py                 # Piste d'audit (écriture unique)
-├── mailbox.py                # Messagerie interne (voir section dédiée)
-├── migrations.py              # Migrations de schéma versionnées, idempotentes
-├── business_logic.py           # Calculs métier (testés par tests/)
-├── barcode_utils.py             # Génération + lecture code-barres
-├── workflow_viz.py                # Schéma de pipeline live + frise + carte de stockage
-├── pdf_reports.py                  # Rapports PDF (patient, VINC)
-├── cdisc_export.py                  # Domaine DM + define.xml
-├── automation.py                     # Relances + diffusion auto (messagerie + SMTP optionnel)
-├── ui.py                              # CSS, bannière, page d'accueil, comptes de démo
-├── constants.py                        # Rôles, permissions, icônes de navigation
-├── hl7_import.py                        # Parseur HL7 v2 (ORU^R01)
-├── gdpr.py                               # Droits RGPD
-├── seed_demo_data.py                      # Génère 25 patients fictifs pour une démo présentable
-├── schema.sql                              # Schéma SQLite (état final pour une base neuve)
-├── conftest.py                              # Permet à pytest d'importer les modules du projet
-├── pytest.ini
-├── requirements.txt
-├── requirements-dev.txt                      # pytest (dev uniquement, pas déployé)
-├── packages.txt                               # dépendances système (libzbar0 pour la caméra)
-├── tests/                                      # 57 tests unitaires (business logic, db, mailbox, migrations)
-├── .github/workflows/tests.yml                  # CI : tests lancés à chaque push
-├── assets/                                       # logos (placeholders fournis, à remplacer)
-├── CSV_Protocol_BLOOD_LIMS.docx                   # modèle de protocole IQ/OQ/PQ
-└── .streamlit/secrets.toml.example
+The application deliberately uses an internal mailbox as the default delivery channel. This makes automation demonstrable without a paid SMTP service. Real SMTP can be enabled later through Streamlit Secrets, but it is not required for the demonstration.
+Final automation model
+The free Streamlit Community Cloud tier is not used as a permanent cron server. The final prototype therefore uses a controlled three-part model:
+Automatic check on app load: the automation engine evaluates the configured weekly, monthly and critical-result rules when the application starts/wakes. This is the closest model available inside the free prototype without introducing a paid or external scheduler.
+Manual deterministic execution: the CRO Automation page provides `Run automation now` and `Run controlled demo (force monthly send)`. The force option bypasses only the calendar/duplicate guard for the monthly job; it never bypasses VINC eligibility or validation status rules.
+GitHub Actions for CI only: the repository keeps a GitHub Actions workflow to run automated tests on pushes/pull requests. It is deliberately not used as a hidden production scheduler for the Streamlit app.
+This makes the automation behavior reproducible during a classroom demonstration while being honest about the free-tier limitation: a sleeping Streamlit application cannot be relied on as a permanently running regulated scheduler. For a real clinical production deployment, the automation runner would be hosted on a qualified persistent service with an appropriate database, monitoring and validated scheduling mechanism.
+Demo automation configuration
+For a deterministic classroom demonstration:
+`Automation enabled`: ON
+`Demo clock`: ON
+`Demo reference date`: 2026-06-25
+`Demo last ingestion date`: 2026-06-18
+Sponsor recipient: sponsor_lph
+Laboratory recipient: lab_tech1
+Critical recipient: biologist1
+With these settings:
+the weekly reminder is due because the reference date is seven days after the last ingestion date;
+the monthly VINC package is due because the reference date is day 25;
+the monthly package contains only `VINC` results that are `ACTIVE` and `REVIEWED` on or before the cut-off;
+unresolved critical results generate an internal alert.
+Recommended demo sequence
+1. Import the supplied laboratory file
+Use the supplied `guide\_v2\_import.csv` from the laboratory central.
+Expected dataset: 45 results / 5 patients / VINC + V1 + V2 / HbA1c + fasting glucose + creatinine.
+The import page performs pre-validation before writing. The source file is hashed and registered in `IMPORT\_BATCHES`.
+2. Technical validation
+Login as:
+```text
+Username: lab\_tech1
+Password: labtech2026
 ```
-Workflow
-```mermaid
-flowchart LR
-    A[Laboratoire central<br/>fichier CSV ou HL7] -->|Ingestion + validation<br/>avant écriture| B[Data Ingestion / HL7 Import]
-    B --> C[Échantillon créé<br/>+ code-barres auto]
-    C --> D[Sample Labels / Storage Map<br/>impression + rangement]
-    D --> E[Technical Validation<br/>Technicien]
-    E --> F[Biological Validation<br/>Signature électronique<br/>Biologiste]
-    F --> G[Patient Records<br/>+ rapport PDF]
-    F --> H[VINC extraction<br/>CRO / Sponsor]
-    F --> I[Export CDISC SDTM<br/>LB + DM + define.xml]
-    C -.scan USB / caméra.-> J[Sample Scan<br/>chaîne de conservation]
-    B -.déclenche.-> K[Automation<br/>Messagerie interne + SMTP optionnel]
-    F -.déclenche.-> K
-    K --> L[Messagerie<br/>de chaque utilisateur]
-    M[User Management<br/>CRO] -.crée/verrouille.-> N[Comptes utilisateurs]
-    E --> O[Audit Trail<br/>append-only]
-    F --> O
-    B --> O
+Go to Technical Validation.
+Use the scope selector and Select all displayed results, then validate all results technically.
+3. Biological validation: VINC only
+Login as:
+```text
+Username: biologist1
+Password: bio2026
 ```
-Installation locale
+Go to Biological Validation.
+Choose VINC only → Select all displayed results.
+Use:
+```text
+Meaning: Reviewed and approved
+Remarks: VINC laboratory results reviewed against the study procedure. No additional comment.
+```
+Re-enter:
+```text
+bio2026
+```
+Then click Sign and finalize validation.
+This makes the monthly VINC package eligible while leaving V1/V2 results available to demonstrate unresolved critical alerts.
+4. Automation preview
+Login as:
+```text
+Username: cro\_arc
+Password: cro2026
+```
+Open Automation.
+Click Live automation preview.
+You should see three jobs:
+Weekly central laboratory file → would trigger
+Monthly VINC package → would trigger if eligible VINC exist
+Critical result alert → would trigger while unresolved critical results remain
+5. Send the monthly package in the demo
+Click:
+Run controlled demo (force monthly send)
+The application will:
+select eligible VINC records;
+generate a ZIP package;
+create the CSV;
+create `manifest.json`;
+calculate the CSV SHA-256;
+calculate the package SHA-256;
+register the package in `EXPORT\_PACKAGES`;
+deliver the package into the sponsor internal mailbox;
+mark the package as `SENT`;
+write automation and export events to the Audit Trail.
+6. Show that the sponsor really received it
+Login as:
+```text
+Username: sponsor\_lph
+Password: sponsor2026
+```
+Open Mailbox.
+Open the monthly BLOOD Study VINC message and download its ZIP attachment.
+Open the ZIP and show:
+```text
+BLOOD\_VINC\_YYYY-MM-DD.csv
+manifest.json
+```
+The manifest contains the cut-off, record count, eligibility rule and hashes.
+7. Prove the package was not silently resent
+Return to Automation as the CRO and click normal Run automation now.
+Because the current month is already marked as sent, the monthly VINC job should not send a second package.
+8. Show the critical alert at the same time
+The supplied dataset contains at least two intentionally critical examples, including:
+`P-FULL-004 / V1 / GLUC = 2.0 mmol/L` with critical-low limit `2.2`;
+`P-FULL-004 / V2 / HBA1C = 13.8 %` with critical-high limit `12.0`.
+Because V1/V2 were not biologically signed in the recommended sequence, the automation engine can send the critical alert to `biologist1` while the monthly VINC package goes to `sponsor\_lph`.
+9. Final evidence
+As CRO, show Audit Trail and filter on:
+```text
+AUTOMATION\_RUN\_COMPLETED
+EXPORT\_PACKAGE\_SENT
+CRITICAL\_ALERT\_SENT
+```
+The demonstration then closes the full business loop:
+```text
+Central Lab
+→ ingestion
+→ technical validation
+→ biological validation
+→ critical alert
+→ monthly VINC package
+→ sponsor mailbox
+→ audit evidence
+```
+Controlled data correction demo
+As CRO open Data Correction / Void.
+Select a non-critical reviewed result and choose Correct result.
+Enter a new value and a mandatory reason, for example:
+```text
+Reason: Source laboratory correction received; superseding result required.
+```
+The application does not overwrite the old value. It creates a new result version and changes the previous record to `SUPERSEDED`.
+Then show the Audit Trail with:
+```text
+old value
+new value
+reason
+user
+timestamp
+object/result identifier
+```
+This demonstrates controlled correction and traceability.
+HL7 demonstration
+Use the supplied `guide\_test\_import.hl7`.
+The message is an `ORU^R01` with HbA1c, fasting glucose and creatinine. The import demonstrates source lineage and parser validation.
+This implementation is file-based: it is not an MLLP network listener.
+Tests
+Run locally:
 ```bash
 pip install -r requirements.txt
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # optionnel, pour un vrai SMTP en plus
-streamlit run streamlit_app.py
-```
-Messagerie interne — pourquoi, et comment ça marche
-Sans identifiants SMTP réels, l'automatisation ne peut pas envoyer de vrais e-mails de façon démontrable. Plutôt que de rester sur une simple simulation, chaque relance (import en retard, extrait VINC non téléchargé, valeurs critiques, comptes rendus signés) est réellement livrée dans une boîte de réception interne à l'application — même principe qu'une messagerie universitaire (identifiant du site, pas un vrai compte Gmail/Outlook).
-Page Messagerie : boîte de réception avec pièces jointes (PDF), et possibilité d'écrire à un autre utilisateur.
-Page Mon Compte : nom, poste, e-mail modifiables ; changement de mot de passe. Nom d'utilisateur et rôle restent réservés au CRO (page User Management), par principe de séparation des responsabilités.
-Un vrai envoi SMTP est fait en plus, automatiquement, si vous configurez un jour de vrais identifiants dans `.streamlit/secrets.toml` — les deux canaux ne s'excluent pas.
-Données de démonstration
-```bash
-python seed_demo_data.py
-```
-Génère 25 patients fictifs répartis sur 3 sites, avec des résultats à différents stades du workflow et une proportion réaliste de valeurs hors-norme (~15%) et critiques (~2%). Idempotent : le relancer ne duplique rien. Ne jamais lancer ce script sur une base contenant de vraies données patients.
-Tests automatisés
-```bash
 pip install -r requirements-dev.txt
-pytest
+pytest -q
 ```
-57 tests couvrent `business_logic.py` (calculs purs), `db.py` (CRUD, verrouillage de compte, jetons de réinitialisation), `mailbox.py` (livraison, lecture croisée bloquée, pièces jointes) et `migrations.py` (chaque migration rejouée sur une base ancienne simulée, y compris le bug de dépendance circulaire entre la migration 1 et la migration 4 découvert et corrigé grâce à ces tests). `.github/workflows/tests.yml` relance cette suite à chaque `git push`.
-Déploiement sur Streamlit Community Cloud (gratuit)
-Poussez ce dossier à la racine de votre repo GitHub.
-Sur share.streamlit.io, fichier principal : `streamlit_app.py`.
-`requirements.txt` et `packages.txt` sont détectés automatiquement.
-Pour activer un vrai SMTP en plus de la messagerie interne : App settings → Secrets, collez le contenu de `.streamlit/secrets.toml.example`.
-Remplacez les logos placeholder dans `assets/` par les vôtres.
-Migration automatique de la base existante
-`migrations.py` détecte et rattrape automatiquement le schéma d'une base créée par une version antérieure de ce projet, sans toucher aux données existantes. 4 migrations à ce jour (gestion des utilisateurs, RGPD/HL7, messagerie interne, correctif `AUDIT_TRAIL.record_ref`) — une ligne `MIGRATION_APPLIED` apparaît dans l'Audit Trail à chaque application.
-Conformité réglementaire
-`CSV_Protocol_BLOOD_LIMS.docx` : modèle de protocole IQ/OQ/PQ à compléter et faire approuver avant toute utilisation avec de vraies données patients.
-Signature électronique : capture le motif ("meaning of signature", 21 CFR Part 11 §11.50) et affiche la mention légale d'engagement.
-Export CDISC : domaines LB et DM + un `define.xml` de départ — à compléter et valider avec un outil type Pinnacle 21 avant tout dépôt réel.
-Sauvegarde manuelle : Settings → Backup.
-Limites connues
-SQLite : adapté à un usage mono-instance / faible concurrence. Migrez vers PostgreSQL (Supabase ou Neon ont un vrai tier gratuit) si la charge ou le nombre de sites augmente.
-Automatisation : vérifiée à chaque chargement de page (pas de vrai cron serveur sur le tier gratuit Streamlit) — mais la livraison en messagerie interne, elle, fonctionne réellement dès qu'une page est ouverte.
-Import HL7 : lit un fichier déjà reçu, n'écoute pas un port réseau/série en temps réel (MLLP/RS-232) — nécessiterait un service séparé tournant en permanence dans le réseau du laboratoire.
-RGPD / HDS : les fonctions d'export et de pseudonymisation rapprochent l'application de la conformité RGPD, mais ne remplacent PAS un hébergement certifié HDS, obligatoire pour de vraies données patients identifiantes en France.
-MSSanté : la diffusion automatique des comptes rendus n'est pas une messagerie de santé accréditée ANS — voir le commentaire dans `automation.py` pour le point d'intégration prévu le jour où vous avez un compte opérateur.
-Comptes de démonstration : les mots de passe en clair dans `schema.sql` (en commentaire) sont uniquement pédagogiques — régénérez-les avant toute donnée patient réelle.
+The CI workflow runs the same suite on GitHub Actions using Python 3.12.
+Deployment on Streamlit Community Cloud
+Push this repository to GitHub.
+Select `streamlit\_app.py` as the main file.
+Keep `requirements.txt` in the repository root.
+Optional: configure SMTP credentials in App settings → Secrets.
+Use the Automation page for the deterministic demo runner; GitHub Actions is used for CI tests only.
+The application uses SQLite for the educational prototype. Do not use this architecture for production clinical data without a validated, persistent, appropriately hosted database and infrastructure.
+Regulatory positioning
+The application is designed to demonstrate concepts expected in a regulated computerized system: controlled roles, auditability, electronic-signature intent, traceable corrections, validated-like imports, metadata, data integrity controls and controlled exports.
+It is not a claim of compliance certification. A production system would still require formal URS, risk assessment, supplier assessment, validation/qualification, SOPs, security controls, backup/restore testing, infrastructure qualification, change control, release management, appropriate hosting and a validated CDISC implementation.
+Demo accounts
+Username	Password	Role
+`lab\_tech1`	`labtech2026`	Laboratory Technician
+`biologist1`	`bio2026`	Biologist
+`physician1`	`doc2026`	Investigator Physician
+`cro\_arc`	`cro2026`	CRO – Clinical Services
+`sponsor\_lph`	`sponsor2026`	LPH Sponsor
+These credentials are for the fictional demonstration environment only.

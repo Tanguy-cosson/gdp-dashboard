@@ -88,7 +88,7 @@ def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
             if "ORU" not in msg_type and "R01" not in msg_type:
                 result.warnings.append(
                     f"Type de message '{msg_type}' inattendu (ORU^R01 attendu). "
-                    "Le fichier sera quand même parsé, vérifiez le résultat."
+                    "The file will still be parsed; review the detected values before importing."
                 )
 
         elif segment_id == "PID":
@@ -112,7 +112,7 @@ def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
         elif segment_id == "OBX":
             fields = _split_fields(line)
             if len(fields) < 6:
-                result.warnings.append(f"Segment OBX incomplet, ignoré : {line[:60]}...")
+                result.warnings.append(f"Incomplete OBX segment ignored: {line[:60]}...")
                 continue
             code_field = fields[3] if len(fields) > 3 else ""
             code_parts = code_field.split("^")
@@ -125,7 +125,7 @@ def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
             abnormal_flag = fields[8] if len(fields) > 8 else ""
 
             if not test_code or not value:
-                result.warnings.append(f"OBX sans code de test ou sans valeur, ignoré : {line[:60]}...")
+                result.warnings.append(f"OBX without test code or value ignored: {line[:60]}...")
                 continue
 
             result.observations.append(HL7Observation(
@@ -134,11 +134,11 @@ def parse_oru_r01(raw_text: str) -> HL7ParsedMessage:
             ))
 
     if not found_msh:
-        result.warnings.append("Aucun segment MSH trouvé — ce fichier ressemble-t-il vraiment à un message HL7 ?")
+        result.warnings.append("No MSH segment found — is this really an HL7 message?")
     if not result.patient_identifier:
-        result.warnings.append("Aucun identifiant patient trouvé (segment PID manquant ou incomplet).")
+        result.warnings.append("No patient identifier found (PID segment missing or incomplete).")
     if not result.observations:
-        result.warnings.append("Aucun résultat exploitable trouvé (segments OBX manquants ou incomplets).")
+        result.warnings.append("No usable result found (OBX segments missing or incomplete).")
 
     return result
 

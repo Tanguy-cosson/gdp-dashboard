@@ -5,17 +5,6 @@ import pandas as pd
 from constants import CRITICAL_FLAG, NORMAL_FLAG, OOR_FLAG
 
 
-def filter_reviewed_only(df: pd.DataFrame) -> pd.DataFrame:
-    """Ne conserve que les résultats ayant franchi la validation biologique
-    (status == 'REVIEWED'). Utilisé avant toute transmission externe
-    (extraction VINC vers le CRO/promoteur) : un résultat encore PENDING
-    ou TECHNICAL_OK n'a pas de valeur probante et ne doit jamais quitter
-    le laboratoire (cf. analyse de risques, risque n°1)."""
-    if df.empty or "status" not in df.columns:
-        return df
-    return df[df["status"] == "REVIEWED"].copy()
-
-
 def compute_oor_flag(df: pd.DataFrame) -> pd.DataFrame:
     """Ajoute une colonne 'Alerte'. Une valeur CRITIQUE (panic value)
     prime toujours sur une simple alerte hors-norme."""
@@ -39,6 +28,52 @@ def compute_oor_flag(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Alerte"] = df.apply(flag, axis=1)
     return df
+
+
+def compute_lbnrind(value, ref_low, ref_high):
+    """Indicateur normalisé CDISC (LBNRIND) : NORMAL / HIGH / LOW.
+    Utilisé dans l'export SDTM LB — distinct de la colonne 'Alerte'
+    affichée dans l'application (qui indique seulement 'hors norme'
+    sans préciser le sens). LBNRIND est un variable attendue du
+    domaine LB pour toute soumission CDISC réelle."""
+    if pd.isna(value) or pd.isna(ref_low) or pd.isna(ref_high):
+        return ""
+    if value < ref_low:
+        return "LOW"
+    if value > ref_high:
+        return "HIGH"
+    return "NORMAL"
+
+
+def select_vinc_for_export(df: pd.DataFrame, cutoff_date) -> pd.DataFrame:
+    """Retourne uniquement les résultats VINC éligibles à une livraison officielle :
+    visite VINC, statut REVIEWED et date de visite <= cut-off explicite.
+
+    Le filtre est volontairement pur/testable afin que la règle d'éligibilité à
+    l'export soit indépendante de l'interface Streamlit.
+    """
+    if df.empty:
+        return df.copy()
+
+    d = df.copy()
+    visit_dates = pd.to_datetime(d["visit_date"], errors="coerce").dt.date
+    cutoff = pd.Timestamp(cutoff_date).date()
+    mask = (d["visit_code"] == "VINC") & (d["status"] == "REVIEWED") & (visit_dates <= cutoff)
+    if "record_status" in d.columns:
+        mask &= d["record_status"].fillna("ACTIVE") == "ACTIVE"
+    return d.loc[mask].copy()
+
+
+def select_reviewed_sdtm_source(df: pd.DataFrame) -> pd.DataFrame:
+    """Source figée pour l'export SDTM : seuls les résultats REVIEWED sont
+    exportables dans le paquet de données finalisé.
+    """
+    if df.empty:
+        return df.copy()
+    mask = df["status"] == "REVIEWED"
+    if "record_status" in df.columns:
+        mask &= df["record_status"].fillna("ACTIVE") == "ACTIVE"
+    return df.loc[mask].copy()
 
 
 def build_patients_matrix(df: pd.DataFrame) -> pd.DataFrame:

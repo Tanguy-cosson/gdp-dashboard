@@ -24,11 +24,20 @@ def generate_dm_domain(conn) -> pd.DataFrame:
     df = read_full_results(conn)
     if df.empty:
         return pd.DataFrame(columns=["STUDYID", "DOMAIN", "USUBJID", "SUBJID", "SITEID",
-                                      "AGE", "AGEU", "SEX", "COUNTRY"])
+                                      "AGE", "AGEU", "SEX", "COUNTRY", "RFSTDTC"])
 
     patients = df.drop_duplicates(subset=["usubjid"]).copy()
     current_year = date.today().year
     patients["AGE"] = current_year - patients["birth_year"]
+
+    # RFSTDTC (date de référence de début) : variable DM attendue par CDISC,
+    # calculée ici comme la date de la première visite documentée du patient
+    # (généralement VINC) — pas encore présente avant cet ajout.
+    first_visit_date = (
+        df.sort_values("visit_date").drop_duplicates(subset=["usubjid"], keep="first")
+        .set_index("usubjid")["visit_date"]
+    )
+    patients["RFSTDTC"] = patients["usubjid"].map(first_visit_date)
 
     dm = pd.DataFrame({
         "STUDYID": STUDYID,
@@ -40,6 +49,7 @@ def generate_dm_domain(conn) -> pd.DataFrame:
         "AGEU": "YEARS",
         "SEX": patients["sex"],
         "COUNTRY": patients["country"],
+        "RFSTDTC": patients["RFSTDTC"],
     })
     return dm.reset_index(drop=True)
 
@@ -72,6 +82,8 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
         <ItemRef ItemOID="IT.LB.VISITNUM" OrderNumber="11" Mandatory="No"/>
         <ItemRef ItemOID="IT.LB.VISIT" OrderNumber="12" Mandatory="No"/>
         <ItemRef ItemOID="IT.LB.LBDTC" OrderNumber="13" Mandatory="No"/>
+        <ItemRef ItemOID="IT.LB.LBNRIND" OrderNumber="14" Mandatory="No"/>
+        <ItemRef ItemOID="IT.LB.LBBLFL" OrderNumber="15" Mandatory="No"/>
       </ItemGroupDef>
 
       <ItemGroupDef OID="IG.DM" Name="DM" Repeating="No" Domain="DM" def:Structure="One record per subject" def:Class="SPECIAL PURPOSE">
@@ -85,6 +97,7 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
         <ItemRef ItemOID="IT.DM.AGEU" OrderNumber="7" Mandatory="No"/>
         <ItemRef ItemOID="IT.DM.SEX" OrderNumber="8" Mandatory="No"/>
         <ItemRef ItemOID="IT.DM.COUNTRY" OrderNumber="9" Mandatory="No"/>
+        <ItemRef ItemOID="IT.DM.RFSTDTC" OrderNumber="10" Mandatory="No"/>
       </ItemGroupDef>
 
       <!-- ItemDefs simplifies : DataType/Length indicatifs, a affiner avant depot reglementaire -->
@@ -101,6 +114,8 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
       <ItemDef OID="IT.LB.VISITNUM" Name="VISITNUM" DataType="integer" Length="8"/>
       <ItemDef OID="IT.LB.VISIT" Name="VISIT" DataType="text" Length="20"/>
       <ItemDef OID="IT.LB.LBDTC" Name="LBDTC" DataType="text" Length="20"/>
+      <ItemDef OID="IT.LB.LBNRIND" Name="LBNRIND" DataType="text" Length="8"/>
+      <ItemDef OID="IT.LB.LBBLFL" Name="LBBLFL" DataType="text" Length="1"/>
 
       <ItemDef OID="IT.DM.STUDYID" Name="STUDYID" DataType="text" Length="20"/>
       <ItemDef OID="IT.DM.DOMAIN" Name="DOMAIN" DataType="text" Length="2"/>
@@ -111,6 +126,7 @@ _DEFINE_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
       <ItemDef OID="IT.DM.AGEU" Name="AGEU" DataType="text" Length="10"/>
       <ItemDef OID="IT.DM.SEX" Name="SEX" DataType="text" Length="1"/>
       <ItemDef OID="IT.DM.COUNTRY" Name="COUNTRY" DataType="text" Length="3"/>
+      <ItemDef OID="IT.DM.RFSTDTC" Name="RFSTDTC" DataType="text" Length="20"/>
 
     </MetaDataVersion>
   </Study>

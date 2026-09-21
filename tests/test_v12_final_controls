@@ -1,0 +1,97 @@
+import hashlib
+from datetime import date
+
+import db
+from audit import log_audit
+from automation import preview_automation, run_automation_now
+from business_logic import select_reviewed_sdtm_source, select_vinc_for_export
+from mailbox import get_inbox, get_message
+
+
+def _seed_reviewed(conn, *, patient_id="P-FINAL", usubjid="U-FINAL", visit="VINC", value=5.5):
+    db.get_or_create_site(conn, "FR-001")
+    pid = db.get_or_create_patient(conn, patient_id, usubjid, "FR-001", "001", "F", 1980)
+    vid = db.get_or_create_visit(conn, pid, visit, "2026-06-01", 1 if visit == "VINC" else 2)
+    sid = db.get_or_create_sample(conn, pid, vid, "SERUM")
+    db.insert_lab_result(conn, vid, "HBA1C", "Hemoglobin A1c", value, "%", "2026-06-01", 4.0, 6.0, sid)
+    rid = conn.execute("SELECT result_id FROM LAB_RESULTS ORDER BY result_id DESC LIMIT 1").fetchone()[0]
+    db.mark_technical_validation(conn, [rid], "lab_tech1")
+    db.mark_biological_validation(conn, [rid], "biologist1", "Reviewed and approved", "Final review")
+    return rid
+
+
+def test_corrected_and_void_records_cannot_enter_official_exports(conn):
+    rid = _seed_reviewed(conn)
+    corrected = db.create_result_correction(conn, rid, 5.8, "Source laboratory correction received; superseding result required.", "cro_arc")
+    df = db.read_full_results(conn)
+    assert rid not in df["result_id"].tolist()
+    assert corrected in df["result_id"].tolist()
+    assert df.loc[df["result_id"] == corrected, "status"].iloc[0] == "PENDING"
+
+    db.mark_technical_validation(conn, [corrected], "lab_tech1")
+    db.mark_biological_validation(conn, [corrected], "biologist1", "Reviewed and approved")
+    df = db.read_full_results(conn)
+    out = select_vinc_for_export(df, date(2026, 6, 30))
+    assert out["result_id"].tolist() == [corrected]
+
+    db.void_result(conn, corrected, "Demonstration void: replacement record received.", "cro_arc")
+    df_active = db.read_full_results(conn)
+    assert corrected not in df_active["result_id"].tolist()
+    assert select_vinc_for_export(df_active, date(2026, 6, 30)).empty
+
+
+def test_sdtm_selection_excludes_superseded_and_void_rows(conn):
+    reviewed_id = _seed_reviewed(conn)
+    df = db.read_full_results(conn, include_history=True)
+    assert reviewed_id in select_reviewed_sdtm_source(df)["result_id"].tolist()
+    corrected = db.create_result_correction(conn, reviewed_id, 5.7, "Controlled correction for demonstration.", "cro_arc")
+    df = db.read_full_results(conn, include_history=True)
+    selected = select_reviewed_sdtm_source(df)
+    assert reviewed_id not in selected["result_id"].tolist()
+    assert corrected not in selected["result_id"].tolist()
+
+
+def test_automation_sends_real_internal_monthly_package_and_alert(conn):
+    # One reviewed VINC record makes the monthly package eligible.
+    _seed_reviewed(conn, patient_id="P-AUTO", usubjid="U-AUTO", visit="VINC", value=5.4)
+    # One unresolved critical V1 record makes the critical alert eligible.
+    db.get_or_create_site(conn, "FR-001")
+    pid = db.get_or_create_patient(conn, "P-CRIT", "U-CRIT", "FR-001", "002", "M", 1970)
+    vid = db.get_or_create_visit(conn, pid, "V1", "2026-07-01", 2)
+    sid = db.get_or_create_sample(conn, pid, vid, "SERUM")
+    db.insert_lab_result(conn, vid, "GLUC", "Fasting Glucose", 2.0, "mmol/L", "2026-07-01", 3.9, 5.6, sid, critical_low=2.2)
+    rid = conn.execute("SELECT result_id FROM LAB_RESULTS ORDER BY result_id DESC LIMIT 1").fetchone()[0]
+    db.mark_technical_validation(conn, [rid], "lab_tech1")
+
+    db.set_setting if hasattr(db, 'set_setting') else None
+    from db import set_setting
+    set_setting(conn, "automation_enabled", "1")
+    set_setting(conn, "automation_demo_mode", "1")
+    set_setting(conn, "automation_demo_date", "2026-06-25")
+    set_setting(conn, "automation_demo_last_ingestion_date", "2026-06-18")
+    set_setting(conn, "notify_emails_lab", "lab_tech1")
+    set_setting(conn, "notify_emails_sponsor", "sponsor_lph")
+    set_setting(conn, "notify_emails_critical", "biologist1")
+
+    preview = preview_automation(conn)
+    assert all(x["would_trigger"] for x in preview)
+
+    run_id, results = run_automation_now(conn, triggered_by="cro_arc", force=True)
+    assert run_id.startswith("RUN-")
+    jobs = {r["job"]: r for r in results}
+    assert jobs["monthly_vinc"]["sent"] == 1
+    assert jobs["critical_pending"]["sent"] == 1
+    assert jobs["weekly_ingestion"]["sent"] == 1
+
+    sponsor_inbox = get_inbox(conn, "sponsor_lph")
+    assert len(sponsor_inbox) >= 1
+    monthly = sponsor_inbox[sponsor_inbox["subject"].str.contains("Monthly VINC package", na=False)].iloc[0]
+    msg = get_message(conn, int(monthly["message_id"]), "sponsor_lph")
+    assert msg["attachment_name"].endswith(".zip")
+    assert msg["attachment_data"]
+
+    pkg_status = conn.execute("SELECT status FROM EXPORT_PACKAGES WHERE package_type='VINC_MONTHLY_CRO_TO_SPONSOR'").fetchone()[0]
+    assert pkg_status == "SENT"
+    assert conn.execute("SELECT COUNT(*) FROM AUTOMATION_RUNS WHERE run_id=?", (run_id,)).fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM AUDIT_TRAIL WHERE action='EXPORT_PACKAGE_SENT'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM AUDIT_TRAIL WHERE action='CRITICAL_ALERT_SENT'").fetchone()[0] == 1

@@ -1,0 +1,97 @@
+import hashlib
+import io
+import json
+from datetime import date
+
+import pandas as pd
+
+import db
+from business_logic import select_reviewed_sdtm_source, select_vinc_for_export
+from export_package import build_vinc_package
+
+
+def _seed_minimal_result(conn, status="PENDING"):
+    db.get_or_create_site(conn, "FR-001")
+    pid = db.get_or_create_patient(conn, "P-1", "U-1", "FR-001", "001", "M", 1980)
+    vid = db.get_or_create_visit(conn, pid, "VINC", "2026-06-01", 1)
+    sid = db.get_or_create_sample(conn, pid, vid, "SERUM")
+    db.insert_lab_result(conn, vid, "HBA1C", "Hemoglobin A1c", 5.5, "%", "2026-06-01", 4.0, 6.0, sid)
+    rid = conn.execute("SELECT result_id FROM LAB_RESULTS").fetchone()[0]
+    if status != "PENDING":
+        db.mark_technical_validation(conn, [rid], "lab_tech1")
+        db.mark_biological_validation(conn, [rid], "biologist1", "Reviewed and approved")
+    return rid
+
+
+def test_vinc_export_requires_reviewed_and_cutoff(conn):
+    rid = _seed_minimal_result(conn, status="REVIEWED")
+    df = db.read_full_results(conn)
+    out = select_vinc_for_export(df, date(2026, 6, 30))
+    assert len(out) == 1
+    assert int(out.iloc[0]["result_id"]) == rid
+
+    out_late = select_vinc_for_export(df, date(2026, 5, 31))
+    assert out_late.empty
+
+    pending_df = df.copy()
+    pending_df.loc[0, "status"] = "PENDING"
+    combined = pd.concat([df, pending_df], ignore_index=True)
+    out2 = select_vinc_for_export(combined, date(2026, 6, 30))
+    assert (out2["status"] == "REVIEWED").all()
+
+
+def test_sdtm_source_is_reviewed_only():
+    df = pd.DataFrame({"status": ["PENDING", "TECHNICAL_OK", "REVIEWED"], "x": [1, 2, 3]})
+    out = select_reviewed_sdtm_source(df)
+    assert out["status"].tolist() == ["REVIEWED"]
+
+
+def test_atomic_batch_import_accepts_and_records_hash(conn):
+    df = pd.DataFrame([{
+        "site_id": "FR-001", "patient_id": "P-ATOMIC", "usubjid": "U-ATOMIC", "subjid": "101",
+        "sex": "F", "birth_year": 1975, "visit_code": "VINC", "visit_date": "2026-06-10", "visit_num": 1,
+        "test_code": "GLUC", "test_name": "Fasting Glucose", "result_value": 5.0, "result_unit": "mmol/L",
+        "result_date": "2026-06-10", "ref_low": 3.9, "ref_high": 5.6,
+    }])
+    payload = df.to_csv(index=False).encode("utf-8")
+    sha = hashlib.sha256(payload).hexdigest()
+    batch_id, inserted, skipped = db.import_lab_results_batch(conn, df, "lab_tech1", "atomic.csv", sha)
+    assert inserted == 1 and skipped == 0
+    row = conn.execute("SELECT status, imported_rows, source_sha256 FROM IMPORT_BATCHES WHERE batch_id = ?", (batch_id,)).fetchone()
+    assert row == ("ACCEPTED", 1, sha)
+
+
+def test_atomic_batch_import_rolls_back_business_rows_on_conflict(conn):
+    good = pd.DataFrame([{
+        "site_id": "FR-001", "patient_id": "P-ROLLBACK", "usubjid": "U-ROLLBACK", "subjid": "102",
+        "sex": "F", "birth_year": 1975, "visit_code": "VINC", "visit_date": "2026-06-11", "visit_num": 1,
+        "test_code": "GLUC", "test_name": "Fasting Glucose", "result_value": 5.0, "result_unit": "mmol/L",
+        "result_date": "2026-06-11", "ref_low": 3.9, "ref_high": 5.6,
+    }])
+    db.import_lab_results_batch(conn, good, "lab_tech1", "first.csv", hashlib.sha256(good.to_csv(index=False).encode()).hexdigest())
+
+    conflict = good.copy()
+    conflict.loc[0, "result_value"] = 9.9
+    with __import__("pytest").raises(ValueError):
+        db.import_lab_results_batch(conn, conflict, "lab_tech1", "conflict.csv", hashlib.sha256(conflict.to_csv(index=False).encode()).hexdigest())
+
+    # Still one business result and a rejected import batch.
+    assert conn.execute("SELECT COUNT(*) FROM LAB_RESULTS WHERE test_code='GLUC'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM IMPORT_BATCHES WHERE status='REJECTED'").fetchone()[0] == 1
+
+
+def test_vinc_package_contains_manifest_and_hash():
+    df = pd.DataFrame([{
+        "usubjid": "U-1", "site_id": "FR-001", "visit_code": "VINC", "visit_date": "2026-06-01",
+        "test_code": "HBA1C", "test_name": "Hemoglobin A1c", "result_value": 5.5, "result_unit": "%",
+        "result_date": "2026-06-01", "status": "REVIEWED",
+    }])
+    pkg = build_vinc_package(df, date(2026, 6, 30), "cro_arc")
+    assert hashlib.sha256(pkg["package_bytes"]).hexdigest() == pkg["package_sha256"]
+    import zipfile
+    with zipfile.ZipFile(io.BytesIO(pkg["package_bytes"])) as zf:
+        names = set(zf.namelist())
+        assert "manifest.json" in names
+        manifest = json.loads(zf.read("manifest.json"))
+        assert manifest["record_count"] == 1
+        assert manifest["csv_sha256"] == pkg["csv_sha256"]

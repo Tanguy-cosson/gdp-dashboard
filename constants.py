@@ -5,21 +5,21 @@ ROLE_LABELS = {
     "BIOLOGIST": "Biologist (biological validation)",
     "PHYSICIAN": "Investigator Physician (patient records)",
     "CRO": "CRO Clinical Services (full oversight)",
-    "SPONSOR": "Promoteur LPH (read-only)",
+    "SPONSOR": "LPH Sponsor (read-only)",
 }
 
 PAGE_PERMISSIONS = {
     "LAB_TECH": ["Data Ingestion", "HL7 Import", "Sample Labels", "Sample Scan", "Storage Map",
-                 "Technical Validation", "Process Flow", "Messagerie", "Mon Compte", "Guide"],
+                 "Technical Validation", "Process Flow", "Mailbox", "My Account", "Guide"],
     "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes",
-                  "Process Flow", "Messagerie", "Mon Compte", "Guide"],
-    "PHYSICIAN": ["Patient Records", "Notes", "Messagerie", "Mon Compte", "Guide"],
+                  "Process Flow", "Mailbox", "My Account", "Guide"],
+    "PHYSICIAN": ["Patient Records", "Notes", "Mailbox", "My Account", "Guide"],
     "CRO": ["Dashboard", "Process Flow", "Patient Search", "Patient follow-up", "Sample Labels",
             "Sample Scan", "Storage Map", "Technical Validation", "Biological Validation",
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
-            "Data Privacy", "Messagerie", "Mon Compte", "Settings", "Automation",
+            "Data Privacy", "Mailbox", "My Account", "Settings", "Automation", "Data Correction / Void",
             "User Management", "Audit Trail", "Guide"],
-    "SPONSOR": ["VINC extraction", "Notes", "Messagerie", "Mon Compte", "Guide"],
+    "SPONSOR": ["VINC extraction", "Notes", "Mailbox", "My Account", "Guide"],
 }
 
 # ---------------------------------------------------------------------
@@ -60,13 +60,14 @@ PAGE_ICONS = {
     "Patient follow-up": "📋", "Patient Records": "👤", "VINC extraction": "📤",
     "Notes": "📝", "Export CDISC SDTM": "📦", "Data Privacy": "🔒",
     "Settings": "⚙️", "Automation": "🤖", "User Management": "👥",
-    "Audit Trail": "🕵️", "Guide": "❓", "Messagerie": "📧", "Mon Compte": "🪪",
+    "Audit Trail": "🕵️", "Guide": "❓", "Mailbox": "📧", "My Account": "🪪",
+    "Data Correction / Void": "✏️",
 }
 
 DEMO_ACCOUNTS = [
-    ("lab_tech1", "labtech2026", "Technicien de laboratoire"),
-    ("biologist1", "bio2026", "Biologiste"),
-    ("physician1", "doc2026", "Médecin investigateur"),
-    ("cro_arc", "cro2026", "CRO (accès complet)"),
-    ("sponsor_lph", "sponsor2026", "Promoteur (Sponsor)"),
+    ("lab_tech1", "labtech2026", "Laboratory Technician"),
+    ("biologist1", "bio2026", "Biologist"),
+    ("physician1", "doc2026", "Investigator Physician"),
+    ("cro_arc", "cro2026", "CRO (full access)"),
+    ("sponsor_lph", "sponsor2026", "Sponsor"),
 ]

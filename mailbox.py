@@ -20,7 +20,7 @@ from db import now_utc_iso
 
 
 def send_internal_message(conn, recipient_username, subject, body,
-                           sender_username=None, sender_label="Automatisation LIMS",
+                           sender_username=None, sender_label="BLOOD LIMS Automation",
                            attachment_bytes=None, attachment_name=None,
                            attachment_mimetype=None):
     conn.execute(
