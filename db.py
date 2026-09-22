@@ -20,6 +20,62 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blood_study.
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 
+def _split_sql_statements(script: str):
+    """Split a SQLite script into complete statements without breaking triggers."""
+    statements = []
+    buffer = []
+    for line in script.splitlines(True):
+        buffer.append(line)
+        candidate = "".join(buffer)
+        if sqlite3.complete_statement(candidate):
+            statement = candidate.strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+    if "".join(buffer).strip():
+        raise sqlite3.DatabaseError("Incomplete SQL statement in schema.sql")
+    return statements
+
+
+def _initialize_schema(conn):
+    """Initialize a new DB and safely upgrade legacy DBs.
+
+    Indexes and views are deliberately created *after* migrations. Older
+    databases may not yet contain columns such as record_status, and SQLite
+    would otherwise fail while executing CREATE INDEX before the migration
+    layer gets a chance to add those columns.
+    """
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        script = f.read()
+
+    statements = _split_sql_statements(script)
+    deferred = []
+    immediate = []
+
+    for statement in statements:
+        normalized = statement.lstrip().upper()
+        if normalized.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX", "CREATE VIEW")):
+            deferred.append(statement)
+        else:
+            immediate.append(statement)
+
+    # First create/seed the structural objects. This is safe for both fresh
+    # and legacy databases because schema.sql uses IF NOT EXISTS semantics.
+    for statement in immediate:
+        conn.executescript(statement)
+    conn.commit()
+
+    # Apply versioned migrations before any object can reference newly added
+    # columns. Import is intentionally deferred to avoid a circular import.
+    from migrations import run_migrations
+    run_migrations(conn)
+
+    # Finally create indexes/views against the now-current schema.
+    for statement in deferred:
+        conn.executescript(statement)
+    conn.commit()
+
+
 @st.cache_resource
 def get_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -27,16 +83,7 @@ def get_connection():
     conn.execute("PRAGMA busy_timeout = 5000;")
     conn.execute("PRAGMA synchronous = FULL;")
     conn.execute("PRAGMA journal_mode = WAL;")
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-        conn.executescript(f.read())
-    conn.commit()
-
-    # Rattrape le schéma des bases créées par une version antérieure de
-    # schema.sql (voir migrations.py). Import différé pour éviter un
-    # cycle (migrations.py importe get_setting/set_setting d'ici).
-    from migrations import run_migrations
-    run_migrations(conn)
-
+    _initialize_schema(conn)
     return conn
 
 
