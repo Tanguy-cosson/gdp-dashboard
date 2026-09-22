@@ -62,17 +62,9 @@ def load_image_base64(relative_path):
 def inject_custom_css():
     st.markdown("""
     <style>
-    [data-testid="stMainBlockContainer"] {
-    padding-top: 0.8rem !important;
-}
-
-.block-container {
-    padding-top: 0 !important;
-}
-
-body {
-    overflow-x: hidden;
-}
+    [data-testid="stMainBlockContainer"] { padding-top: 0.8rem !important; }
+    .block-container { padding-top: 0 !important; }
+    body { overflow-x: hidden; }
     [data-testid="stSidebar"] { background: #123C5A; border-right: 1px solid #0D2C42; }
     [data-testid="stSidebar"] * { color: #FFFFFF !important; }
     [data-testid="stSidebar"] [data-baseweb="input"] {
@@ -128,14 +120,11 @@ body {
     .hero-banner {
         position: relative; overflow: hidden;
         background: linear-gradient(135deg, #123C5A 0%, #1B6EA5 100%);
-        border-radius: 0 10px 10px 0; padding: 1.6rem 2.5rem 1.6rem 1.8rem;
-        margin-left: -1rem;
-        margin-right: -1rem;
-        margin-top: -0.8rem;
-        margin-bottom: 1.4rem;
-        width: calc(100% + 2rem); min-height: 110px; box-sizing: border-box;
+        border-radius: 0 10px 10px 0; padding: 1.8rem 3rem 1.8rem 2rem;
+        margin-left: -1rem; margin-right: -1rem; margin-top: 0; margin-bottom: 1.4rem;
+        width: calc(100% + 2rem); min-height: 120px; box-sizing: border-box;
     }
-    .hero-banner h1 { color: #FFFFFF; font-size: 1.9rem; font-weight: 800; margin: 0 0 0.2rem 0; }
+    .hero-banner h1 { color: #FFFFFF; font-size: 2.1rem; font-weight: 800; margin: 0 0 0.2rem 0; }
     .hero-banner p { color: #DCEBF7; font-size: 1rem; margin: 0; position: relative; z-index: 2; }
     .hero-network {
         position: absolute; top: -10px; right: -10px; width: 52%; height: 180%;
