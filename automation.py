@@ -226,11 +226,13 @@ def _job_monthly_vinc(conn, reference_date, force=False):
         return {"job": "monthly_vinc", "triggered": True, "sent": 0, "detail": "Eligible package exists, but no sponsor recipient is configured."}
 
     package = build_vinc_package(eligible, reference_date, "system")
+    archive_dt = datetime.combine(reference_date, datetime.min.time(), tzinfo=timezone.utc)
     archive_document(
         conn, package["package_bytes"], package["filename"],
         stakeholder="Clinical_Services", direction="OUTBOUND", document_type="VINC_PACKAGE",
         created_by="system", related_id=package["package_id"],
-        description="Monthly VINC package automatically archived before sponsor delivery.", mimetype="application/zip"
+        description="Monthly VINC package automatically archived before sponsor delivery.",
+        archive_datetime=archive_dt, mimetype="application/zip"
     )
     register_export_package(
         conn, package["package_id"], "VINC_MONTHLY_CRO_TO_SPONSOR", "system", reference_date,
@@ -262,7 +264,8 @@ def _job_monthly_vinc(conn, reference_date, force=False):
             conn, package["package_bytes"], package["filename"],
             stakeholder="LPH_Sponsor", direction="INBOUND", document_type="SPONSOR_RECEIPT",
             created_by="system", related_id=package["package_id"],
-            description="Sponsor-side receipt copy retained by the demonstration archive.", mimetype="application/zip"
+            description="Sponsor-side receipt copy retained by the demonstration archive.",
+            archive_datetime=archive_dt, mimetype="application/zip"
         )
         set_setting(conn, "last_vinc_sent_period", period)
     log_audit(conn, "EXPORT_PACKAGES", "EXPORT_VINC_CRO", "system", record_ref=package["package_id"],
@@ -388,33 +391,61 @@ def check_and_send_reminders(conn):
 
 
 def get_weekly_ingestion_compliance(conn, n_weeks=8):
-    audit_df = read_audit_trail(conn)
-    ingestion_df = audit_df[audit_df["action"].isin(["INGESTION_CSV", "INGESTION_HL7"])].copy() if not audit_df.empty else audit_df
-    if not ingestion_df.empty:
-        ingestion_df["event_timestamp"] = pd.to_datetime(ingestion_df["event_timestamp"], errors="coerce", utc=True).dt.tz_localize(None)
-        ingestion_df["week"] = ingestion_df["event_timestamp"].dt.to_period("W-SUN")
+    """Show weekly receipt compliance using the business receipt timestamp.
+
+    For the training/demo data this timestamp is carried by IMPORT_BATCHES.received_at
+    from the CSV ``source_received_datetime``. This keeps historical weeks aligned
+    with the actual simulated laboratory reception week instead of the audit-row
+    creation time.
+    """
+    rows = conn.execute(
+        "SELECT received_at FROM IMPORT_BATCHES "
+        "WHERE status = 'ACCEPTED' AND received_at IS NOT NULL "
+        "ORDER BY received_at"
+    ).fetchall()
+    receipt_dates = pd.to_datetime(
+        [r[0] for r in rows], errors="coerce", utc=True
+    ).tz_localize(None) if rows else pd.DatetimeIndex([])
+
     today = pd.Timestamp.now(tz="UTC").tz_localize(None)
     weeks = pd.period_range(end=today.to_period("W-SUN"), periods=n_weeks, freq="W-SUN")
+
     return pd.DataFrame([
-        {"Week": f"{wk.start_time.date()} to {wk.end_time.date()}",
-         "File received": "✅" if (not ingestion_df.empty and (ingestion_df["week"] == wk).any()) else "❌",
-         "Number of ingestions": int((ingestion_df["week"] == wk).sum()) if not ingestion_df.empty else 0}
+        {
+            "Week": f"{wk.start_time.date()} to {wk.end_time.date()}",
+            "File received": "✅" if any(receipt_dates.to_period("W-SUN") == wk) else "❌",
+            "Number of ingestions": int((receipt_dates.to_period("W-SUN") == wk).sum()),
+        }
         for wk in weeks
     ])
 
 
 def get_monthly_vinc_compliance(conn, n_months=6):
-    audit_df = read_audit_trail(conn)
-    actions = ["EXPORT_VINC_CRO", "CONSULTATION_VINC_SPONSOR", "EXPORT_PACKAGE_SENT"]
-    vinc_df = audit_df[audit_df["action"].isin(actions)].copy() if not audit_df.empty else audit_df
-    if not vinc_df.empty:
-        vinc_df["event_timestamp"] = pd.to_datetime(vinc_df["event_timestamp"], errors="coerce", utc=True).dt.tz_localize(None)
-        vinc_df["month"] = vinc_df["event_timestamp"].dt.to_period("M")
+    """Show monthly CRO→Sponsor compliance using the package cut-off month.
+
+    SENT VINC_MONTHLY_CRO_TO_SPONSOR packages are matched on EXPORT_PACKAGES.cutoff_date,
+    which is the contractual business period represented by the package. This lets
+    historical/demo packages remain green in their actual month even when the
+    database row was created later.
+    """
+    rows = conn.execute(
+        "SELECT cutoff_date FROM EXPORT_PACKAGES "
+        "WHERE package_type='VINC_MONTHLY_CRO_TO_SPONSOR' "
+        "AND status='SENT' AND cutoff_date IS NOT NULL "
+        "ORDER BY cutoff_date"
+    ).fetchall()
+    cutoff_dates = pd.to_datetime(
+        [r[0] for r in rows], errors="coerce"
+    ) if rows else pd.DatetimeIndex([])
+
     today = pd.Timestamp.now(tz="UTC").tz_localize(None)
     months = pd.period_range(end=today.to_period("M"), periods=n_months, freq="M")
+
     return pd.DataFrame([
-        {"Month": str(m),
-         "Package sent/consulted": "✅" if (not vinc_df.empty and (vinc_df["month"] == m).any()) else "❌",
-         "Number of actions": int((vinc_df["month"] == m).sum()) if not vinc_df.empty else 0}
+        {
+            "Month": str(m),
+            "Package sent/consulted": "✅" if any(cutoff_dates.to_period("M") == m) else "❌",
+            "Number of actions": int((cutoff_dates.to_period("M") == m).sum()),
+        }
         for m in months
     ])
