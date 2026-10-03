@@ -701,6 +701,7 @@ def page_guide(role):
         ],
         "CRO": [
             ("📊 Dashboard", "Monitor global KPIs and critical results."),
+            ("🗂️ Archive", "Browse the automatically organised CRO and sponsor-facing document archives."),
             ("🧭 Process Flow", "View the live laboratory workflow."),
             ("📦 VINC extraction", "Prepare the official VINC sponsor package using a documented cut-off and reviewed-only eligibility."),
             ("🤖 Automation", "Preview, execute and audit weekly/monthly automation jobs; use the controlled demo mode for the presentation."),
@@ -711,6 +712,7 @@ def page_guide(role):
         ],
         "SPONSOR": [
             ("📤 VINC extraction", "View and download the reviewed VINC sponsor package available at the documented cut-off."),
+            ("🗂️ Archive", "Browse sponsor-visible packages and receipts in the automatic year → quarter → month archive."),
             ("📧 Mailbox", "Receive the monthly sponsor package automatically in the internal mailbox."),
         ],
     }
@@ -845,16 +847,27 @@ def render_cro_archive_explorer(conn, section_key="dashboard_cro_archive"):
                                         )
 
 
-def render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive"):
-    """Display the sponsor archive as year -> quarter -> month -> stakeholder -> type."""
+def render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive", sponsor_only=False):
+    """Display the sponsor archive as year -> quarter -> month -> stakeholder -> type.
+
+    When sponsor_only=True, expose only sponsor-facing artefacts (VINC packages,
+    VINC PDFs and sponsor receipts) and do not expose internal CRO automation messages.
+    """
     st.subheader("📦 Sponsor Archive")
     st.caption(
         "Automatic sponsor archive — calendar year → quarter → month → stakeholder → document type."
     )
 
     sponsor_df = list_sponsor_archive(conn)
+    if sponsor_only and not sponsor_df.empty:
+        sponsor_df = sponsor_df[
+            sponsor_df["document_type"].astype(str).isin(
+                ["VINC_PACKAGE", "VINC_PDF", "SPONSOR_RECEIPT"]
+            )
+        ].copy()
+
     if sponsor_df.empty:
-        st.info("No sponsor-facing archive documents yet. Generate a monthly VINC package first.")
+        st.info("No sponsor-visible archive documents yet. Generate a monthly VINC package first.")
         return
 
     f1, f2 = st.columns([3, 2])
@@ -865,9 +878,10 @@ def render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive
             key=f"{section_key}_search",
         )
     with f2:
+        stakeholder_options = sorted(sponsor_df["stakeholder"].dropna().astype(str).unique().tolist())
         stakeholder = st.selectbox(
             "Stakeholder",
-            ["All", "Clinical_Services", "LPH_Sponsor"],
+            ["All"] + stakeholder_options,
             key=f"{section_key}_stakeholder",
         )
 
@@ -1049,6 +1063,65 @@ def page_dashboard(conn):
 
     st.markdown("---")
     render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive")
+
+
+def page_archive(conn, user_name, role):
+    """Dedicated archive explorer page.
+
+    CRO: sees both operational CRO archive and sponsor-facing archive.
+    SPONSOR: sees only sponsor-visible documents.
+    """
+    st.markdown(
+        _html("""
+        <div class="dashboard-header">
+          <div>
+            <div class="section-kicker">BLOOD Study · controlled document repository</div>
+            <div class="dashboard-title">🗂️ Archive Explorer</div>
+            <p class="dashboard-subtitle">Automatic, date-based document retrieval</p>
+          </div>
+        </div>
+        """),
+        unsafe_allow_html=True,
+    )
+
+    archive_df = list_archive(conn)
+    sponsor_df = list_sponsor_archive(conn)
+    sponsor_df = sponsor_df[
+        sponsor_df["document_type"].astype(str).isin(
+            ["VINC_PACKAGE", "VINC_PDF", "SPONSOR_RECEIPT"]
+        )
+    ].copy() if not sponsor_df.empty else sponsor_df
+
+    total_cro = len(archive_df)
+    total_sponsor = len(sponsor_df)
+    years = sorted(archive_df["archive_year"].dropna().astype(int).unique().tolist(), reverse=True) if not archive_df.empty else []
+    sponsor_years = sorted(sponsor_df["calendar_year"].dropna().astype(int).unique().tolist(), reverse=True) if not sponsor_df.empty else []
+
+    cards = []
+    cards.append(kpi_card("Archived documents", total_cro if role == "CRO" else total_sponsor, "📁", "#2E86C1"))
+    cards.append(kpi_card("Archive years", len(years) if role == "CRO" else len(sponsor_years), "🗓️", "#1B4F72"))
+    cards.append(kpi_card("Sponsor-visible", total_sponsor, "📦", "#2E8B57"))
+    st.markdown(_html(f'<div class="kpi-grid">{"".join(cards)}</div>'), unsafe_allow_html=True)
+
+    with st.container(border=True):
+        st.markdown("**How the archive is organised**")
+        if role == "CRO":
+            st.caption("CRO working archive: ISO year → ISO week → stakeholder → document type → file.")
+            st.caption("Sponsor archive: calendar year → quarter → month → stakeholder → document type → file.")
+        else:
+            st.caption("Sponsor-visible archive: calendar year → quarter → month → stakeholder → document type → file.")
+        st.caption("Folders are created logically from archive metadata; users never create folders manually.")
+
+    if role == "CRO":
+        tab_cro, tab_sponsor = st.tabs(["📁 CRO archive", "📦 Sponsor archive"])
+        with tab_cro:
+            render_cro_archive_explorer(conn, section_key="dedicated_cro_archive")
+        with tab_sponsor:
+            st.caption("CRO view of the sponsor-facing repository.")
+            render_sponsor_archive_explorer(conn, section_key="dedicated_sponsor_archive", sponsor_only=False)
+    else:
+        st.caption("Only sponsor-facing artefacts are displayed in this account.")
+        render_sponsor_archive_explorer(conn, section_key="sponsor_only_archive", sponsor_only=True)
 
 
 def page_patient_search(conn):
@@ -1901,6 +1974,8 @@ def main():
         page_biological_validation(conn, username)
     elif page == "Dashboard":
         page_dashboard(conn)
+    elif page == "Archive":
+        page_archive(conn, username, role)
     elif page == "Process Flow":
         page_process_flow(conn)
     elif page == "Patient Search":
