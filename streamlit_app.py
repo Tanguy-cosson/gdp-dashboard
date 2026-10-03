@@ -10,7 +10,7 @@ from audit import log_audit
 from archive_service import (
     archive_document, available_archive_weeks, available_archive_years, build_archive_bundle, list_archive,
     available_sponsor_months, available_sponsor_quarters, available_sponsor_years,
-    build_sponsor_archive_bundle, list_sponsor_archive, logical_archive_path,
+    build_sponsor_archive_bundle, list_sponsor_archive, logical_archive_path, get_archived_document,
 )
 from auth import (generate_temp_password, handle_password_reset_flow, hash_password,
                    sidebar_user_identification, validate_password_complexity)
@@ -720,6 +720,203 @@ def page_guide(role):
             st.caption(explanation)
 
 
+
+# =====================================================================
+# VISUAL ARCHIVE EXPLORERS
+# =====================================================================
+
+def _archive_file_icon(document_type: str, filename: str) -> str:
+    """Return a simple visual icon for an archived artefact."""
+    dtype = str(document_type or "").upper()
+    name = str(filename or "").lower()
+    if name.endswith(".zip"):
+        return "📦"
+    if name.endswith(".hl7"):
+        return "🔹"
+    if name.endswith(".csv"):
+        return "📄"
+    if "AUDIT" in dtype:
+        return "🔐"
+    if "AUTOMATION" in dtype:
+        return "⚙️"
+    if "MANIFEST" in dtype:
+        return "🧾"
+    return "📄"
+
+
+def _render_archive_file_card(conn, row, key_prefix: str, show_logical_path=False):
+    """Render one archive file with metadata and a download action."""
+    icon = _archive_file_icon(row.get("document_type", ""), row.get("filename", ""))
+    col_file, col_action = st.columns([4.5, 1])
+    with col_file:
+        logical = f"<div style='color:#94A3B8;font-size:.75rem;word-break:break-all;'>{row.get('logical_path','')}</div>" if show_logical_path else ""
+        st.markdown(
+            f"""
+            <div style="padding:.78rem;margin-bottom:.35rem;border:1px solid #DCE5ED;
+                        border-radius:10px;background:#FAFCFE;">
+                <div style="font-weight:700;font-size:1rem;">
+                    {icon} {row.get('filename','')}
+                </div>
+                <div style="color:#64748B;font-size:.82rem;margin-top:.18rem;">
+                    {row.get('archive_date','')} · {row.get('document_type','')} · {row.get('stakeholder','')}
+                </div>
+                {logical}
+                <div style="color:#94A3B8;font-size:.75rem;margin-top:.18rem;word-break:break-all;">
+                    SHA-256: {row.get('sha256','')}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col_action:
+        archived = get_archived_document(conn, int(row["archive_id"]))
+        if archived:
+            st.download_button(
+                "Download",
+                data=archived["content"],
+                file_name=archived["filename"],
+                mime=archived["mimetype"],
+                key=f"{key_prefix}_{int(row['archive_id'])}",
+            )
+
+
+def render_cro_archive_explorer(conn, section_key="dashboard_cro_archive"):
+    """Display the CRO archive as year -> ISO week -> stakeholder -> type."""
+    st.subheader("📁 CRO Document Archive")
+    st.caption(
+        "Automatic archive — ISO year → ISO week → stakeholder → document type. "
+        "Users never create folders manually."
+    )
+
+    archive_df = list_archive(conn)
+    if archive_df.empty:
+        st.info("No archived documents yet. Import a laboratory file to create the first archive entry.")
+        return
+
+    f1, f2 = st.columns([3, 2])
+    with f1:
+        query = st.text_input(
+            "🔎 Search archive",
+            placeholder="Filename, stakeholder, document type, week...",
+            key=f"{section_key}_search",
+        )
+    with f2:
+        options = ["All"] + sorted(archive_df["stakeholder"].dropna().astype(str).unique().tolist())
+        stakeholder = st.selectbox("Stakeholder", options, key=f"{section_key}_stakeholder")
+
+    filtered = archive_df.copy()
+    if stakeholder != "All":
+        filtered = filtered[filtered["stakeholder"] == stakeholder]
+    if query.strip():
+        q = query.strip().lower()
+        mask = (
+            filtered["filename"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["stakeholder"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["document_type"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["week_key"].astype(str).str.lower().str.contains(q, na=False)
+        )
+        filtered = filtered[mask]
+
+    if filtered.empty:
+        st.warning("No archive item matches the current filter.")
+        return
+
+    st.markdown(
+        f"<div class='lims-panel'><strong>Archive content</strong><br>"
+        f"<span style='color:#64748B;'>{len(filtered)} archived document(s)</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    for year in sorted(filtered["archive_year"].dropna().astype(int).unique().tolist(), reverse=True):
+        year_df = filtered[filtered["archive_year"] == year]
+        with st.expander(f"📁 {year} · {len(year_df)} document(s)", expanded=True):
+            for week in sorted(year_df["iso_week"].dropna().astype(int).unique().tolist(), reverse=True):
+                week_df = year_df[year_df["iso_week"] == week]
+                with st.expander(f"📁 W{week:02d} · {len(week_df)} document(s)", expanded=False):
+                    for stakeholder_name in sorted(week_df["stakeholder"].dropna().astype(str).unique().tolist()):
+                        stakeholder_df = week_df[week_df["stakeholder"] == stakeholder_name]
+                        with st.expander(f"📁 {stakeholder_name} · {len(stakeholder_df)} document(s)", expanded=False):
+                            for document_type in sorted(stakeholder_df["document_type"].dropna().astype(str).unique().tolist()):
+                                dtype_df = stakeholder_df[stakeholder_df["document_type"] == document_type]
+                                with st.expander(f"📁 {document_type} · {len(dtype_df)} file(s)", expanded=False):
+                                    for _, row in dtype_df.iterrows():
+                                        _render_archive_file_card(
+                                            conn, row, f"{section_key}_cro", show_logical_path=False
+                                        )
+
+
+def render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive"):
+    """Display the sponsor archive as year -> quarter -> month -> stakeholder -> type."""
+    st.subheader("📦 Sponsor Archive")
+    st.caption(
+        "Automatic sponsor archive — calendar year → quarter → month → stakeholder → document type."
+    )
+
+    sponsor_df = list_sponsor_archive(conn)
+    if sponsor_df.empty:
+        st.info("No sponsor-facing archive documents yet. Generate a monthly VINC package first.")
+        return
+
+    f1, f2 = st.columns([3, 2])
+    with f1:
+        query = st.text_input(
+            "🔎 Search sponsor archive",
+            placeholder="Filename, stakeholder, document type, month...",
+            key=f"{section_key}_search",
+        )
+    with f2:
+        stakeholder = st.selectbox(
+            "Stakeholder",
+            ["All", "Clinical_Services", "LPH_Sponsor"],
+            key=f"{section_key}_stakeholder",
+        )
+
+    filtered = sponsor_df.copy()
+    if stakeholder != "All":
+        filtered = filtered[filtered["stakeholder"] == stakeholder]
+    if query.strip():
+        q = query.strip().lower()
+        mask = (
+            filtered["filename"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["stakeholder"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["document_type"].astype(str).str.lower().str.contains(q, na=False)
+            | filtered["logical_path"].astype(str).str.lower().str.contains(q, na=False)
+        )
+        filtered = filtered[mask]
+
+    if filtered.empty:
+        st.warning("No sponsor archive item matches the current filter.")
+        return
+
+    month_names = {
+        1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
+        7:"July",8:"August",9:"September",10:"October",11:"November",12:"December"
+    }
+
+    for year in sorted(filtered["calendar_year"].dropna().astype(int).unique().tolist(), reverse=True):
+        year_df = filtered[filtered["calendar_year"] == year]
+        with st.expander(f"📁 {year} · {len(year_df)} document(s)", expanded=True):
+            for quarter in sorted(year_df["quarter"].dropna().astype(int).unique().tolist(), reverse=True):
+                quarter_df = year_df[year_df["quarter"] == quarter]
+                with st.expander(f"📁 Q{quarter} · {len(quarter_df)} document(s)", expanded=False):
+                    for month in sorted(quarter_df["month"].dropna().astype(int).unique().tolist(), reverse=True):
+                        month_df = quarter_df[quarter_df["month"] == month]
+                        label = month_names.get(month, f"Month {month}")
+                        with st.expander(
+                            f"📁 {year}-{month:02d} — {label} · {len(month_df)} document(s)",
+                            expanded=False,
+                        ):
+                            for stakeholder_name in sorted(month_df["stakeholder"].dropna().astype(str).unique().tolist()):
+                                stakeholder_df = month_df[month_df["stakeholder"] == stakeholder_name]
+                                with st.expander(f"📁 {stakeholder_name} · {len(stakeholder_df)} document(s)", expanded=False):
+                                    for document_type in sorted(stakeholder_df["document_type"].dropna().astype(str).unique().tolist()):
+                                        dtype_df = stakeholder_df[stakeholder_df["document_type"] == document_type]
+                                        with st.expander(f"📁 {document_type} · {len(dtype_df)} file(s)", expanded=False):
+                                            for _, row in dtype_df.iterrows():
+                                                _render_archive_file_card(
+                                                    conn, row, f"{section_key}_sponsor", show_logical_path=True
+                                                )
+
 def page_dashboard(conn):
     """Executive CRO dashboard with real-time clock, KPIs, charts, alerts,
     contractual cadence and weekly document archive browser."""
@@ -848,56 +1045,10 @@ def page_dashboard(conn):
         st.dataframe(get_monthly_vinc_compliance(conn, n_months=6), use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.subheader(tr("Document archive"))
-    if not archive_years:
-        st.info(tr("No archived documents"))
-    else:
-        ac1, ac2, ac3 = st.columns([1,1,1.4])
-        with ac1:
-            y = st.selectbox(tr("Archive year"), archive_years, key="dash_archive_year")
-        with ac2:
-            weeks = available_archive_weeks(conn, y)
-            w = st.selectbox(tr("ISO week"), weeks, key="dash_archive_week")
-        with ac3:
-            stakeholders = ["All"] + sorted([r[0] for r in conn.execute("SELECT DISTINCT stakeholder FROM ARCHIVE_ENTRIES WHERE archive_year=? AND iso_week=? ORDER BY stakeholder", (y,w)).fetchall()])
-            s = st.selectbox(tr("Stakeholder"), stakeholders, key="dash_archive_stakeholder")
-        adf = list_archive(conn, y, w, s)
-        st.dataframe(adf, use_container_width=True, hide_index=True)
-        bundle = build_archive_bundle(conn, y, w)
-        if bundle:
-            st.info(f"Archive path: {bundle['root']}/ · {bundle['record_count']} artifact(s)")
-            if st.download_button(tr("Build weekly archive bundle"), bundle["bytes"], file_name=bundle["filename"], mime="application/zip", key="dash_weekly_archive"):
-                log_audit(conn, "ARCHIVE_ENTRIES", "ARCHIVE_BUNDLE_DOWNLOADED", st.session_state.get("auth_username","system"), record_ref=bundle["filename"], comment=bundle["root"])
+    render_cro_archive_explorer(conn, section_key="dashboard_cro_archive")
 
     st.markdown("---")
-    st.subheader(tr("Sponsor archive"))
-    sponsor_years = available_sponsor_years(conn)
-    if not sponsor_years:
-        st.info(tr("No sponsor archive documents"))
-    else:
-        sa1, sa2, sa3, sa4 = st.columns([1, 0.8, 1, 1.6])
-        with sa1:
-            sy = st.selectbox(tr("Archive year"), sponsor_years, key="dash_sponsor_year")
-        quarters = available_sponsor_quarters(conn, sy)
-        with sa2:
-            sq = st.selectbox(tr("Quarter"), quarters, key="dash_sponsor_quarter")
-        months = available_sponsor_months(conn, sy, sq)
-        with sa3:
-            month_options = [0] + months
-            sm = st.selectbox(tr("Month"), month_options, format_func=lambda m: tr("All months") if m == 0 else f"{int(m):02d}", key="dash_sponsor_month")
-        with sa4:
-            sstake = st.selectbox(tr("Stakeholder"), ["All", "Clinical_Services", "LPH_Sponsor"], key="dash_sponsor_stakeholder")
-        sponsor_df = list_sponsor_archive(conn, sy, sq, None if sm == 0 else sm, sstake)
-        if sponsor_df.empty:
-            st.info(tr("No sponsor archive documents"))
-        else:
-            shown = sponsor_df[["archive_date","logical_path","stakeholder","document_type","filename","sha256","created_by","created_at"]].copy()
-            st.dataframe(shown, use_container_width=True, hide_index=True)
-            sbundle = build_sponsor_archive_bundle(conn, sy, sq, None if sm == 0 else sm)
-            if sbundle:
-                st.info(f"Archive tree: {sbundle['root']}/ · {sbundle['record_count']} artifact(s)")
-                if st.download_button(tr("Build sponsor archive bundle"), sbundle["bytes"], file_name=sbundle["filename"], mime="application/zip", key="dash_sponsor_archive"):
-                    log_audit(conn, "ARCHIVE_ENTRIES", "SPONSOR_ARCHIVE_BUNDLE_DOWNLOADED", st.session_state.get("auth_username","system"), record_ref=sbundle["filename"], comment=sbundle["root"])
+    render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive")
 
 
 def page_patient_search(conn):
@@ -1480,52 +1631,12 @@ def page_automation(conn, user_name):
         "The system now archives inbound laboratory files, outbound sponsor packages and automation run reports by ISO year/week."
     )
 
-    # Archive controls stay inside Automation so no additional page is added.
+    # Archive explorers stay inside Automation so no additional page is added.
     st.markdown("---")
-    st.subheader("📁 CRO working archive — ISO year / ISO week")
-    archive_years = available_archive_years(conn)
-    if archive_years:
-        cy, cw = st.columns(2)
-        with cy:
-            ay = st.selectbox("Archive year", archive_years, key="automation_archive_year")
-        with cw:
-            aws = available_archive_weeks(conn, ay)
-            aw = st.selectbox("ISO week", aws, key="automation_archive_week")
-        entries = list_archive(conn, ay, aw)
-        st.caption(f"Logical archive: {ay}/W{aw:02d}/ · {len(entries)} artifact(s)")
-        st.dataframe(entries, use_container_width=True, hide_index=True)
-        bundle = build_archive_bundle(conn, ay, aw)
-        if bundle:
-            st.download_button("Download CRO weekly archive ZIP", bundle["bytes"], file_name=bundle["filename"], mime="application/zip", key="automation_archive_download")
-    else:
-        st.info("No archive artifacts yet. Import a laboratory file to create the first archive entry.")
+    render_cro_archive_explorer(conn, section_key="automation_cro_archive")
 
     st.markdown("---")
-    st.subheader("📦 Sponsor archive — year / quarter / month")
-    sponsor_years = available_sponsor_years(conn)
-    if sponsor_years:
-        sa1, sa2, sa3, sa4 = st.columns([1, 0.8, 1, 1.4])
-        with sa1:
-            sy = st.selectbox("Calendar year", sponsor_years, key="automation_sponsor_year")
-        sqs = available_sponsor_quarters(conn, sy)
-        with sa2:
-            sq = st.selectbox("Quarter", sqs, key="automation_sponsor_quarter")
-        sms = available_sponsor_months(conn, sy, sq)
-        with sa3:
-            sm = st.selectbox("Month", [0] + sms, format_func=lambda m: "All months" if m == 0 else f"{int(m):02d}", key="automation_sponsor_month")
-        with sa4:
-            sstake = st.selectbox("Stakeholder", ["All", "Clinical_Services", "LPH_Sponsor"], key="automation_sponsor_stakeholder")
-        sponsor_df = list_sponsor_archive(conn, sy, sq, None if sm == 0 else sm, sstake)
-        st.caption(f"Logical sponsor archive: {sy}/Q{sq}/" + ("" if sm == 0 else f"{sy}-{int(sm):02d}/") + f" · {len(sponsor_df)} artifact(s)")
-        if not sponsor_df.empty:
-            st.dataframe(sponsor_df[["archive_date","logical_path","stakeholder","document_type","filename","sha256"]], use_container_width=True, hide_index=True)
-            sbundle = build_sponsor_archive_bundle(conn, sy, sq, None if sm == 0 else sm)
-            if sbundle:
-                st.download_button("Download sponsor archive ZIP", sbundle["bytes"], file_name=sbundle["filename"], mime="application/zip", key="automation_sponsor_archive_download")
-        else:
-            st.info("No sponsor archive artifacts for this period.")
-    else:
-        st.info("No sponsor-facing archive artifacts yet. Generate a monthly VINC package to create them.")
+    render_sponsor_archive_explorer(conn, section_key="automation_sponsor_archive")
 
     st.markdown("---")
     st.subheader("🔍 Preview")
