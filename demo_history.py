@@ -46,10 +46,7 @@ REVIEW_PLANS = {
     "W15": "REVIEWED",
     # Recent period: deliberately mixed for dashboard realism.
     "W17": "MIXED",
-    "W19": "MIXED",
-    "W21": "TECHNICAL_OK",
-    "W23": "PENDING",
-    "W25": "PENDING",
+    "W18": "MIXED",
 }
 
 
@@ -268,26 +265,12 @@ REVIEW_PLANS = {
     "W15": "REVIEWED",
     # Recent period: deliberately mixed for dashboard realism.
     "W17": "MIXED",
-    "W19": "MIXED",
-    "W21": "TECHNICAL_OK",
-    "W23": "PENDING",
-    "W25": "PENDING",
+    "W18": "MIXED",
     # Extension W27-W49: the batch itself is always REVIEWED (closed,
     # historical month) except the very last one, which is left PENDING so
     # the live demo still has a "current" queue to work through, exactly
     # like W25 did before this extension.
-    "W27": "REVIEWED",
-    "W29": "REVIEWED",
-    "W31": "REVIEWED",
-    "W33": "REVIEWED",
-    "W35": "REVIEWED",
-    "W37": "REVIEWED",
-    "W39": "REVIEWED",
-    "W41": "REVIEWED",
-    "W43": "REVIEWED",
-    "W45": "REVIEWED",
-    "W47": "REVIEWED",
-    "W49": "PENDING",
+   
 }
 
 
