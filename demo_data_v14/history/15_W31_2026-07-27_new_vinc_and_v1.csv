@@ -1,0 +1,4 @@
+site_id,patient_id,usubjid,subjid,sex,birth_year,visit_code,visit_date,visit_num,sample_type,collection_datetime,source_received_datetime,test_code,test_name,result_value,result_unit,result_date,ref_low,ref_high,critical_low,critical_high
+FR-001,P-V14-017,BLOOD-V14-017,317,F,1989,VINC,2026-07-27,1,SERUM,2026-07-27T08:00:00Z,2026-07-27T18:10:00Z,HBA1C,Hemoglobin A1c,5.6,%,2026-07-27,4.0,6.0,,12.0
+FR-001,P-V14-017,BLOOD-V14-017,317,F,1989,VINC,2026-07-27,1,SERUM,2026-07-27T08:00:00Z,2026-07-27T18:10:00Z,GLUC,Fasting Glucose,5.0,mmol/L,2026-07-27,3.9,5.6,2.2,22.0
+FR-001,P-V14-017,BLOOD-V14-017,317,F,1989,VINC,2026-07-27,1,SERUM,2026-07-27T08:00:00Z,2026-07-27T18:10:00Z,CREAT,Creatinine,82,umol/L,2026-07-27,60,110,,400

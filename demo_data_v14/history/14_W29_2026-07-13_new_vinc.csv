@@ -1,0 +1,4 @@
+site_id,patient_id,usubjid,subjid,sex,birth_year,visit_code,visit_date,visit_num,sample_type,collection_datetime,source_received_datetime,test_code,test_name,result_value,result_unit,result_date,ref_low,ref_high,critical_low,critical_high
+BE-001,P-V14-016,BLOOD-V14-016,316,M,1987,VINC,2026-07-13,1,SERUM,2026-07-13T08:00:00Z,2026-07-13T18:05:00Z,HBA1C,Hemoglobin A1c,7.8,%,2026-07-13,4.0,6.0,,12.0
+BE-001,P-V14-016,BLOOD-V14-016,316,M,1987,VINC,2026-07-13,1,SERUM,2026-07-13T08:00:00Z,2026-07-13T18:05:00Z,GLUC,Fasting Glucose,8.0,mmol/L,2026-07-13,3.9,5.6,2.2,22.0
+BE-001,P-V14-016,BLOOD-V14-016,316,M,1987,VINC,2026-07-13,1,SERUM,2026-07-13T08:00:00Z,2026-07-13T18:05:00Z,CREAT,Creatinine,95,umol/L,2026-07-13,60,110,,400
