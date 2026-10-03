@@ -1,24 +1,14 @@
-# BLOOD LIMS V14 — Visual Archive Tree Fix
+# BLOOD LIMS V14 — Data Correction / Void fix
 
-These are the only code files modified for the visual archive-explorer change.
+Problem fixed:
+`NameError: name 'page_data_correction' is not defined`
 
-## Replace
-- `archive_service.py` → replace the existing root file.
-- `streamlit_app.py` → replace the existing root file.
+Changes in `streamlit_app.py` only:
+- adds the missing `page_data_correction()` page implementation;
+- imports `read_result_history` and `void_result` from `db`;
+- imports `sqlite3` for the existing error handling.
 
-## No other code file needs to be replaced.
+No database schema change and no change to `db.py`.
 
-The change keeps the existing archive repository and metadata. It only:
-- adds retrieval of archived file content for download;
-- renders CRO archive as `Year → ISO Week → Stakeholder → Document Type → File`;
-- renders Sponsor archive as `Year → Quarter → Month → Stakeholder → Document Type → File`;
-- adds archive search and per-file download cards.
-
-## Checks
-```bash
-python -m py_compile archive_service.py streamlit_app.py
-pytest -q
-streamlit run streamlit_app.py
-```
-
-No database schema change is required by this visual change.
+Installation:
+Replace the repository `streamlit_app.py` with the patched file, commit/push to GitHub, then let Streamlit Cloud redeploy.

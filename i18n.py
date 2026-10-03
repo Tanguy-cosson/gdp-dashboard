@@ -25,7 +25,7 @@ TRANSLATIONS = {
         "Archive year":"Archive year","ISO week":"ISO week","Stakeholder":"Stakeholder","Quarter":"Quarter","Month":"Month","All months":"All months",
         "Sponsor archive":"Sponsor archive","No sponsor archive documents":"No sponsor archive documents for this period.","Build sponsor archive bundle":"Build sponsor archive bundle",
         "Build weekly archive bundle":"Build weekly archive bundle","No archived documents":"No archived documents for this period.",
-        "Log out":"Log out","Password":"Password","User identifiant":"User identifiant","Log in":"Log in",
+        "Log out":"Log out","Password":"Password","User identifiant":"User identifiant","Log in":"Log in","Archive":"Archive","Archive explorer":"Archive explorer","CRO archive":"CRO archive","Sponsor archive":"Sponsor archive","Sponsor-visible documents only":"Sponsor-visible documents only",
     },
     "fr": {
         "Language":"Langue","Navigation":"Navigation","Dashboard":"Tableau de bord",
@@ -47,7 +47,7 @@ TRANSLATIONS = {
         "Monthly CRO → sponsor":"Mensuelle CRO → promoteur","Document archive":"Archive documentaire",
         "Archive year":"Année d'archive","ISO week":"Semaine ISO","Stakeholder":"Partie prenante",
         "Build weekly archive bundle":"Créer le dossier d'archive hebdomadaire","No archived documents":"Aucun document archivé pour cette période.",
-        "Log out":"Déconnexion","Password":"Mot de passe","User identifiant":"Identifiant utilisateur","Log in":"Connexion",
+        "Log out":"Déconnexion","Password":"Mot de passe","User identifiant":"Identifiant utilisateur","Log in":"Connexion","Archive":"Archive","Archive explorer":"Explorateur d’archives","CRO archive":"Archive CRO","Sponsor archive":"Archive promoteur","Sponsor-visible documents only":"Uniquement les documents visibles par le promoteur",
     },
 }
 

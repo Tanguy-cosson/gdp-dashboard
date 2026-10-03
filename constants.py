@@ -14,12 +14,12 @@ PAGE_PERMISSIONS = {
     "BIOLOGIST": ["Biological Validation", "Sample Scan", "Patient Records", "Notes",
                   "Process Flow", "Mailbox", "My Account", "Guide"],
     "PHYSICIAN": ["Patient Records", "Notes", "Mailbox", "My Account", "Guide"],
-    "CRO": ["Dashboard", "Process Flow", "Patient Search", "Patient follow-up", "Sample Labels",
+    "CRO": ["Dashboard", "Archive", "Process Flow", "Patient Search", "Patient follow-up", "Sample Labels",
             "Sample Scan", "Storage Map", "Technical Validation", "Biological Validation",
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
             "Data Privacy", "Mailbox", "My Account", "Settings", "Automation", "Data Correction / Void",
             "User Management", "Audit Trail", "Guide"],
-    "SPONSOR": ["VINC extraction", "Notes", "Mailbox", "My Account", "Guide"],
+    "SPONSOR": ["VINC extraction", "Archive", "Notes", "Mailbox", "My Account", "Guide"],
 }
 
 # ---------------------------------------------------------------------
@@ -61,7 +61,7 @@ PAGE_ICONS = {
     "Notes": "📝", "Export CDISC SDTM": "📦", "Data Privacy": "🔒",
     "Settings": "⚙️", "Automation": "🤖", "User Management": "👥",
     "Audit Trail": "🕵️", "Guide": "❓", "Mailbox": "📧", "My Account": "🪪",
-    "Data Correction / Void": "✏️",
+    "Data Correction / Void": "✏️", "Archive": "🗂️",
 }
 
 DEMO_ACCOUNTS = [

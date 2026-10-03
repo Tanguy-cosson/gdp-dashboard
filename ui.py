@@ -82,6 +82,19 @@ def inject_custom_css():
     }
     [data-testid="stSidebar"] [data-baseweb="input"] button { background: transparent !important; }
     [data-testid="stSidebar"] label { font-weight: 600 !important; }
+    /* Language selector: white sidebar, white control, dark readable value/text. */
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] {
+        background: #FFFFFF !important;
+        border-radius: 8px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] * {
+        color: #1B2631 !important;
+        -webkit-text-fill-color: #1B2631 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] svg {
+        fill: #1B2631 !important;
+        color: #1B2631 !important;
+    }
     [data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.25); }
     .sidebar-login-title { font-size: 1.3rem; font-weight: 700; margin-bottom: 0.6rem; }
     .sidebar-login-hint { font-style: italic; font-size: 0.82rem; opacity: 0.85; margin-top: 0.6rem; }
