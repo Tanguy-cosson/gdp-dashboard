@@ -122,6 +122,17 @@ def validate_ingestion_dataframe(df: pd.DataFrame):
                       "result_value", "result_unit", "result_date"]
     errors = []
 
+    if "source_received_datetime" in df.columns:
+        for idx, value in df["source_received_datetime"].items():
+            line_no = idx + 2
+            if pd.notna(value) and str(value).strip():
+                try:
+                    parsed = pd.to_datetime(value, utc=True, errors="raise")
+                    if pd.isna(parsed):
+                        raise ValueError
+                except Exception:
+                    errors.append(f"Ligne {line_no} : source_received_datetime='{value}' invalide.")
+
     missing_cols = [c for c in required_cols if c not in df.columns]
     if missing_cols:
         errors.append(f"Colonnes manquantes dans le CSV : {', '.join(missing_cols)}")

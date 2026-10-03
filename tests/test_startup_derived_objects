@@ -1,0 +1,73 @@
+import importlib.util
+import sqlite3
+import sys
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_migrations():
+    db_mod = types.ModuleType("db")
+    def set_setting(conn, key, value):
+        conn.execute(
+            "INSERT INTO SETTINGS(setting_key, setting_value) VALUES (?, ?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+            (key, value),
+        )
+        conn.commit()
+    db_mod.set_setting = set_setting
+    sys.modules["db"] = db_mod
+
+    audit_mod = types.ModuleType("audit")
+    audit_mod.log_audit = lambda *args, **kwargs: None
+    sys.modules["audit"] = audit_mod
+
+    spec = importlib.util.spec_from_file_location("migrations", ROOT / "migrations.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_legacy_database_gets_derived_view_after_migrations():
+    # _load_migrations() temporarily replaces sys.modules['db'] and
+    # sys.modules['audit'] with lightweight stubs. Preserve and restore the
+    # real modules so this isolation test cannot affect tests that follow it.
+    old_db = sys.modules.get("db")
+    old_audit = sys.modules.get("audit")
+    conn = None
+    try:
+        migrations = _load_migrations()
+        conn = sqlite3.connect(":memory:")
+        conn.executescript((ROOT / "schema.sql").read_text())
+        conn.execute("DROP VIEW IF EXISTS V_LAB_RESULTS_FULL")
+        conn.execute(
+            "CREATE TABLE legacy_lr AS "
+            "SELECT result_id, visit_id, sample_id, status, result_value FROM LAB_RESULTS"
+        )
+        conn.execute("DROP TABLE LAB_RESULTS")
+        conn.execute("ALTER TABLE legacy_lr RENAME TO LAB_RESULTS")
+        conn.commit()
+
+        migrations.run_migrations(conn)
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(LAB_RESULTS)").fetchall()}
+        assert "record_status" in cols
+        assert conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='view' AND name='V_LAB_RESULTS_FULL'"
+        ).fetchone() is not None
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_lab_results_record_status'"
+        ).fetchone() is not None
+    finally:
+        if conn is not None:
+            conn.close()
+        if old_db is not None:
+            sys.modules["db"] = old_db
+        else:
+            sys.modules.pop("db", None)
+        if old_audit is not None:
+            sys.modules["audit"] = old_audit
+        else:
+            sys.modules.pop("audit", None)

@@ -1,13 +1,17 @@
 import hashlib
 import io
-import sqlite3
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from audit import log_audit
+from archive_service import (
+    archive_document, available_archive_weeks, available_archive_years, build_archive_bundle, list_archive,
+    available_sponsor_months, available_sponsor_quarters, available_sponsor_years,
+    build_sponsor_archive_bundle, list_sponsor_archive, logical_archive_path,
+)
 from auth import (generate_temp_password, handle_password_reset_flow, hash_password,
                    sidebar_user_identification, validate_password_complexity)
 from automation import (check_and_send_reminders, get_monthly_vinc_compliance,
@@ -19,6 +23,7 @@ from business_logic import (build_patients_matrix, compute_lbnrind, compute_oor_
                              compute_tat_hours, select_reviewed_sdtm_source, select_vinc_for_export,
                              validate_ingestion_dataframe)
 from cdisc_export import generate_define_xml, generate_dm_domain
+from demo_history import load_demo_history
 from constants import (ALL_ROLES, CRITICAL_FLAG, ESIGNATURE_LEGAL_NOTICE, NORMAL_FLAG,
                         OOR_FLAG, PAGE_ICONS, PAGE_PERMISSIONS, ROLE_LABELS,
                         SIGNATURE_REASONS, STUDYID)
@@ -29,12 +34,12 @@ from db import (DB_PATH, add_storage_location, admin_reset_password, count_by_st
                 get_samples_pending_labels, get_samples_without_storage, get_setting,
                 get_usubjids_for_results, import_lab_results_batch, insert_lab_result, insert_remark, list_users,
                 mark_biological_validation, mark_labels_printed, mark_technical_validation,
-                create_result_correction, read_audit_trail, read_full_results, read_remarks,
-                read_result_history, set_setting, set_user_active, set_user_role, void_result,
-                username_exists)
+                create_result_correction, read_audit_trail, read_full_results, read_remarks, set_setting,
+                set_user_active, set_user_role, username_exists)
 from export_package import build_vinc_package
 from gdpr import anonymize_patient, export_patient_data, get_all_consent, record_consent
 from hl7_import import parse_oru_r01, parse_ref_range
+from i18n import tr, translate_page
 from mailbox import (count_unread, get_inbox, get_message, list_active_usernames,
                       mark_as_read, send_internal_message, send_internal_message_to_many)
 from pdf_reports import generate_patient_pdf_report, generate_vinc_pdf_report
@@ -64,7 +69,7 @@ def days_since_last_action(conn, actions):
 
 
 def render_central_lab_reminder(conn):
-    days = days_since_last_action(conn, ["INGESTION_CSV"])
+    days = days_since_last_action(conn, ["INGESTION_CSV", "INGESTION_HL7"])
     if days is None:
         st.warning("⏰ No filing has yet been made. The protocol provides for a filing "
                    "every week — please submit the first file.")
@@ -110,12 +115,12 @@ def render_critical_alert_banner(conn):
 # PAGES — LABORATORY TECHNICIAN
 # =====================================================================
 def page_ingestion(conn, user_name):
-    st.title("DATA INGESTION")
+    st.title(tr("DATA INGESTION", "DATA INGESTION"))
     render_central_lab_reminder(conn)
     st.caption("This module only allows you to ADD results. Optional CSV columns: "
                "ref_low / ref_high (normal range), critical_low / critical_high (panic "
                "values), sample_type (WHOLE_BLOOD/SERUM/PLASMA, default SERUM), "
-               "collection_datetime.")
+               "collection_datetime, and demo-only source_received_datetime for controlled historical rehearsal.")
 
     uploaded_file = st.file_uploader("CSV file to import", type=["csv"])
     if uploaded_file is None:
@@ -154,8 +159,31 @@ def page_ingestion(conn, user_name):
         source_sha256 = hashlib.sha256(raw_bytes).hexdigest()
         progress.progress(10, text="File hashed — starting atomic transaction...")
         try:
+            source_received = None
+            archive_dt = None
+            try:
+                if "source_received_datetime" in df.columns and df["source_received_datetime"].notna().any():
+                    source_received = str(df["source_received_datetime"].dropna().iloc[0])
+                    parsed_received = pd.to_datetime(source_received, utc=True, errors="raise")
+                    archive_dt = parsed_received.to_pydatetime()
+                else:
+                    source_period = pd.to_datetime(df["result_date"], errors="coerce").max()
+                    if pd.notna(source_period):
+                        archive_dt = source_period.to_pydatetime().replace(hour=12, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+            except Exception:
+                source_received = None
+                archive_dt = None
+
             batch_id, inserted, skipped = import_lab_results_batch(
-                conn, df, user_name, uploaded_file.name or "uploaded.csv", source_sha256
+                conn, df, user_name, uploaded_file.name or "uploaded.csv", source_sha256,
+                received_at=source_received
+            )
+            archive_document(
+                conn, raw_bytes, uploaded_file.name or "uploaded.csv",
+                stakeholder="Central_Lab_Results", direction="INBOUND", document_type="CSV",
+                created_by=user_name, related_id=batch_id,
+                description="Source laboratory CSV received by Clinical Services CRO; archived automatically by source reception period for retrieval.",
+                archive_datetime=archive_dt, mimetype="text/csv"
             )
             progress.progress(100, text="Import completed")
         except Exception as e:
@@ -174,7 +202,7 @@ def page_ingestion(conn, user_name):
 
 def page_sample_labels(conn, user_name):
     """Physical sample traceability: barcode label generation for received samples."""
-    st.title("SAMPLE LABELS (barcode printing)")
+    st.title(tr("SAMPLE LABELS (barcode printing)", "SAMPLE LABELS (barcode printing)"))
     st.caption("Generate Code128 barcode labels (50×25mm) for physical sample tubes. "
                 "Each barcode encodes the sample_id — scan it later from 'Sample Scan' "
                 "to instantly pull up the chain of custody and results.")
@@ -228,7 +256,7 @@ def page_sample_labels(conn, user_name):
 
 def page_sample_scan(conn, user_name):
     """Barcode scanning: instant sample lookup. A USB scanner behaves like a keyboard; a phone camera can also be used."""
-    st.title("SAMPLE SCAN")
+    st.title(tr("SAMPLE SCAN", "SAMPLE SCAN"))
 
     st.markdown('<div class="scan-box">📷 Scan with a USB scanner or type the sample ID below</div>',
                 unsafe_allow_html=True)
@@ -297,7 +325,7 @@ def page_sample_scan(conn, user_name):
 
 def page_storage_map(conn):
     """Visual chain-of-custody overview: physical storage locations and samples that still require storage."""
-    st.title("🧊 STORAGE MAP")
+    st.title(tr("🧊 STORAGE MAP", "🧊 STORAGE MAP"))
     st.caption("Distribution of samples by freezer / rack / box, "
                 "and detection of samples that have never been physically stored.")
 
@@ -316,7 +344,7 @@ def page_storage_map(conn):
 
 
 def page_technical_validation(conn, user_name):
-    st.title("TECHNICAL VALIDATION")
+    st.title(tr("TECHNICAL VALIDATION", "TECHNICAL VALIDATION"))
     st.caption("Results awaiting technical validation (status PENDING). "
                 "Tick the ones you have checked, then confirm to move them to TECHNICAL_OK.")
 
@@ -362,7 +390,7 @@ def page_technical_validation(conn, user_name):
 def page_biological_validation(conn, user_name):
     """Biological validation with electronic signature. Only explicitly selected TECHNICAL_OK results can be signed.
     The form captures the signature meaning and requires password re-authentication."""
-    st.title("🧪 BIOLOGICAL VALIDATION")
+    st.title(tr("🧪 BIOLOGICAL VALIDATION", "🧪 BIOLOGICAL VALIDATION"))
     render_critical_alert_banner(conn)
 
     df = read_full_results(conn)
@@ -485,7 +513,7 @@ def _maybe_auto_send_reports(conn, result_ids, user_name):
 # =====================================================================
 def page_process_flow(conn):
     """Workflow visualization: live counters plus a Kanban-style view of samples at each workflow stage."""
-    st.title("PROCESS FLOW")
+    st.title(tr("PROCESS FLOW", "PROCESS FLOW"))
     render_critical_alert_banner(conn)
 
     st.caption("Live workflow diagram: counters reflect the current database state.")
@@ -526,7 +554,7 @@ def page_process_flow(conn):
 
 def page_mon_compte(conn, user_name, role, full_name):
     """Personal account area: profile, job title, e-mail and password change. Username and role are read-only here and remain CRO-controlled."""
-    st.title("🪪 MY ACCOUNT")
+    st.title(tr("🪪 MY ACCOUNT", "🪪 MY ACCOUNT"))
 
     cur = conn.execute(
         "SELECT full_name, email, job_title FROM USERS WHERE username = ?", (user_name,)
@@ -588,7 +616,7 @@ def page_mon_compte(conn, user_name, role, full_name):
 
 def page_messagerie(conn, user_name):
     """Internal mailbox: receives automation messages and allows users to message one another. It is an application mailbox, not an external e-mail provider."""
-    st.title("📧 MAILBOX")
+    st.title(tr("📧 MAILBOX", "📧 MAILBOX"))
 
     tab_inbox, tab_compose = st.tabs(["📥 Inbox", "✉️ New message"])
 
@@ -642,7 +670,7 @@ def page_messagerie(conn, user_name):
 
 
 def page_guide(role):
-    st.title("❓ GUIDE")
+    st.title(tr("❓ GUIDE", "❓ GUIDE"))
     st.caption("Role-specific in-app guidance. The full SOP and demonstration guide are provided with the project package.")
 
     st.subheader("General principle")
@@ -693,116 +721,187 @@ def page_guide(role):
 
 
 def page_dashboard(conn):
-    st.title("DASHBOARD")
-    render_critical_alert_banner(conn)
-
-    with st.container(border=True):
-        render_central_lab_reminder(conn)
-
+    """Executive CRO dashboard with real-time clock, KPIs, charts, alerts,
+    contractual cadence and weekly document archive browser."""
     df = read_full_results(conn)
-    if df.empty:
-        st.info("No data available. Ask the laboratory technician to import a file.")
-        return
-
-    df = compute_oor_flag(df)
-    n_oor = int((df["Alerte"] == OOR_FLAG).sum())
-    n_critical = int((df["Alerte"] == CRITICAL_FLAG).sum())
-    n_pending = int((df["status"] == "PENDING").sum())
-    n_tech_ok = int((df["status"] == "TECHNICAL_OK").sum())
-    n_reviewed = int((df["status"] == "REVIEWED").sum())
-    review_pct = round((n_reviewed / len(df)) * 100) if len(df) else 0
-
-    kpi_cards = "".join([
-        kpi_card("Results", len(df), "🧪", "#2E86C1"),
-        kpi_card("Patients", df["usubjid"].nunique(), "🧍", "#1B4F72"),
-        kpi_card("Sites", df["site_id"].nunique(), "🏥", "#3498DB"),
-        kpi_card("Outliers", n_oor, "⚠️", "#B03A2E"),
-        kpi_card("Critical", n_critical, "🔴", "#7B241C"),
-    ])
-    st.markdown(_html(f'<div class="kpi-grid">{kpi_cards}</div>'), unsafe_allow_html=True)
-
-    tat1, tat2 = compute_tat_hours(df)
-    tat1_label = f"{tat1:.1f} h" if tat1 is not None else "n/a"
-    tat2_label = f"{tat2:.1f} h" if tat2 is not None else "n/a"
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
 
     st.markdown(_html(f"""
-    <div class="lims-panel">
-        <h4>Validation queue &amp; turnaround time</h4>
-        <div class="funnel-row">
-            <div class="funnel-stage"><div class="funnel-count">{n_pending}</div><div class="funnel-label">Awaiting technician</div></div>
-            <div class="funnel-stage"><div class="funnel-count">{n_tech_ok}</div><div class="funnel-label">Awaiting biologist</div></div>
-            <div class="funnel-stage"><div class="funnel-count">{n_reviewed}</div><div class="funnel-label">Validated</div></div>
-            <div class="funnel-stage"><div class="funnel-count">{tat1_label}</div><div class="funnel-label">Avg. TAT receipt→technical</div></div>
-            <div class="funnel-stage"><div class="funnel-count">{tat2_label}</div><div class="funnel-label">Avg. TAT technical→biologist</div></div>
-        </div>
+    <div class="dashboard-header">
+      <div>
+        <div class="section-kicker">BLOOD Study · CRO operational control</div>
+        <div class="dashboard-title">{tr('Dashboard')}</div>
+        <p class="dashboard-subtitle">{tr('Real-time overview')}</p>
+      </div>
+      <div class="live-clock">
+        <div class="label">{tr('Local time')}</div>
+        <div class="value">{now_local.strftime('%d %b %Y · %H:%M:%S %Z')}</div>
+        <div class="label" style="margin-top:.3rem;">{tr('UTC time')}</div>
+        <div class="value" style="font-size:.84rem;">{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
+      </div>
     </div>
     """), unsafe_allow_html=True)
 
-    col_donut, col_activity = st.columns([1, 1.4])
-    with col_donut:
-        st.markdown(_html(f"""
-        <div class="lims-panel">
-            <h4>Overall validation progress</h4>
-            <div class="donut-wrap">
-                <div class="donut" style="--pct:{review_pct}%;">
-                    <div class="donut-hole">
-                        <div class="donut-pct">{review_pct}%</div>
-                        <div class="donut-caption">reviewed</div>
-                    </div>
-                </div>
-                <div class="donut-legend">
-                    <div class="legend-item"><span class="legend-dot" style="background:#2E86C1;"></span>Reviewed ({n_reviewed})</div>
-                    <div class="legend-item"><span class="legend-dot" style="background:#E9EEF3;"></span>In progress ({n_pending + n_tech_ok})</div>
-                </div>
-            </div>
-        </div>
-        """), unsafe_allow_html=True)
+    st.caption(f"Last dashboard refresh: {now_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    render_critical_alert_banner(conn)
+    with st.container(border=True):
+        render_central_lab_reminder(conn)
+        render_sponsor_reminder(conn)
 
-    with col_activity:
-        audit_df = read_audit_trail(conn)
-        recent = audit_df.head(6) if not audit_df.empty else audit_df
-        if recent is None or recent.empty:
-            items_html = '<li class="activity-item"><span class="activity-meta">No activity recorded yet.</span></li>'
+    if df.empty:
+        st.info("No data available. Start with Data Ingestion to receive the Central Laboratory weekly file.")
+        return
+
+    df = compute_oor_flag(df)
+    n_total = len(df)
+    n_patients = df["usubjid"].nunique()
+    n_sites = df["site_id"].nunique()
+    n_reviewed = int((df["status"] == "REVIEWED").sum())
+    n_pending = int((df["status"] == "PENDING").sum())
+    n_tech = int((df["status"] == "TECHNICAL_OK").sum())
+    n_critical_pending = int(((df["Alerte"] == CRITICAL_FLAG) & (df["status"] != "REVIEWED") & (df["record_status"] == "ACTIVE")).sum())
+    review_pct = round((n_reviewed / n_total) * 100, 1) if n_total else 0
+    archive_years = available_archive_years(conn)
+
+    cards = "".join([
+        kpi_card(tr("Total results"), n_total, "🧪", "#2E86C1"),
+        kpi_card(tr("Patients"), n_patients, "👤", "#1B4F72"),
+        kpi_card(tr("Sites"), n_sites, "🏥", "#3498DB"),
+        kpi_card(tr("Reviewed"), f"{review_pct}%", "✅", "#2E8B57"),
+        kpi_card(tr("Critical pending"), n_critical_pending, "🔴", "#A93226"),
+    ])
+    st.markdown(_html(f'<div class="kpi-grid">{cards}</div>'), unsafe_allow_html=True)
+
+    tat_tech, tat_bio = compute_tat_hours(df)
+    tat_tech_txt = f"{tat_tech:.1f} h" if tat_tech is not None else "n/a"
+    tat_bio_txt = f"{tat_bio:.1f} h" if tat_bio is not None else "n/a"
+    st.markdown(_html(f"""<div class="lims-panel">
+      <h4>{tr('Validation progress')}</h4>
+      <div class="funnel-row">
+        <div class="funnel-stage"><div class="funnel-count">{n_pending}</div><div class="funnel-label">Awaiting technician</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{n_tech}</div><div class="funnel-label">Awaiting biologist</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{n_reviewed}</div><div class="funnel-label">Reviewed</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{tat_tech_txt}</div><div class="funnel-label">Receipt → technical</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{tat_bio_txt}</div><div class="funnel-label">Technical → biological</div></div>
+      </div>
+    </div>"""), unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    status = df.groupby("status").size().reset_index(name="Count")
+    fig = px.pie(status, names="status", values="Count", hole=0.62,
+                 title=f"<b>{tr('Validation progress')}</b>", color="status",
+                 color_discrete_map={"PENDING":"#B9C6D2","TECHNICAL_OK":"#5B9BD5","REVIEWED":"#55A868"})
+    fig.update_layout(height=350, margin=dict(l=20,r=20,t=55,b=15), legend_title_text="")
+    with c1: st.plotly_chart(fig, use_container_width=True)
+
+    alert_df = df.copy()
+    alert_df["Alert class"] = alert_df["Alerte"].map({NORMAL_FLAG:"NORMAL", OOR_FLAG:"OUT-OF-RANGE", CRITICAL_FLAG:"CRITICAL"}).fillna("UNCLASSIFIED")
+    alert_df = alert_df.groupby("Alert class").size().reset_index(name="Count")
+    fig2 = px.bar(alert_df, x="Alert class", y="Count", color="Alert class",
+                  title=f"<b>{tr('Alerts distribution')}</b>", text_auto=True,
+                  color_discrete_map={"NORMAL":"#55A868","OUT-OF-RANGE":"#E6A23C","CRITICAL":"#C84B3A","UNCLASSIFIED":"#9AA5B1"})
+    fig2.update_layout(height=350, margin=dict(l=20,r=20,t=55,b=15), showlegend=False, xaxis_title=None, yaxis_title="Results")
+    with c2: st.plotly_chart(fig2, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    visit_data = df.groupby(["visit_code","test_code"]).size().reset_index(name="Count")
+    fig3 = px.bar(visit_data, x="visit_code", y="Count", color="test_code", barmode="stack",
+                  title=f"<b>{tr('Results by visit')}</b>", text_auto=True)
+    fig3.update_layout(height=360, margin=dict(l=20,r=20,t=55,b=15), xaxis_title=None, yaxis_title="Results")
+    with c3: st.plotly_chart(fig3, use_container_width=True)
+
+    tmp = df.copy()
+    tmp["result_date_dt"] = pd.to_datetime(tmp["result_date"], errors="coerce")
+    weekly_results = tmp.dropna(subset=["result_date_dt"]).assign(week=lambda x: x["result_date_dt"].dt.to_period("W-SUN").dt.start_time).groupby("week").size().reset_index(name="Count")
+    if weekly_results.empty:
+        weekly_results = pd.DataFrame({"week":[pd.Timestamp.now().normalize()],"Count":[len(df)]})
+    fig4 = px.line(weekly_results, x="week", y="Count", markers=True, title=f"<b>{tr('Results over time')}</b>")
+    fig4.update_layout(height=360, margin=dict(l=20,r=20,t=55,b=15), xaxis_title=None, yaxis_title="Results")
+    with c4: st.plotly_chart(fig4, use_container_width=True)
+
+    st.markdown("---")
+    left, right = st.columns([1.15,1])
+    with left:
+        st.subheader(tr("Recent critical alerts"))
+        crit = df[(df["Alerte"] == CRITICAL_FLAG) & (df["status"] != "REVIEWED") & (df["record_status"] == "ACTIVE")]
+        if crit.empty:
+            st.success("No unresolved critical result currently pending review.")
         else:
-            items_html = "".join(
-                f'<li class="activity-item"><span class="activity-action">{r["action"]}</span>'
-                f'<span class="activity-meta">{r["user_name"]} · {r["event_timestamp"][:16].replace("T", " ")}</span></li>'
-                for _, r in recent.iterrows()
-            )
-        st.markdown(_html(f"""
-        <div class="lims-panel"><h4>Recent system events</h4><ul class="activity-list">{items_html}</ul></div>
-        """), unsafe_allow_html=True)
+            st.dataframe(crit[["result_id","usubjid","visit_code","test_code","result_value","result_unit","status"]].sort_values("result_id", ascending=False).head(10), use_container_width=True, hide_index=True)
+    with right:
+        st.subheader(tr("Recent system activity"))
+        audit_df = read_audit_trail(conn)
+        if audit_df.empty:
+            st.info("No audit events have been recorded yet.")
+        else:
+            st.dataframe(audit_df.head(8)[["action","user_name","event_timestamp","record_ref"]], use_container_width=True, hide_index=True)
 
-    col_left, col_right = st.columns(2)
-    with col_left:
-        visit_data = df.groupby("visit_code").size().reset_index(name="count")
-        fig_visit = px.bar(visit_data, x="visit_code", y="count", title="<b>Results per visit</b>",
-                            text_auto=True, color_discrete_sequence=["#2E86C1"])
-        fig_visit.update_layout(xaxis_title=None, yaxis_title="Count", xaxis_tickangle=0,
-                                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                                 margin=dict(l=20, r=20, t=40, b=20), height=340)
-        fig_visit.update_traces(textposition="outside")
-        st.plotly_chart(fig_visit, use_container_width=True)
+    st.markdown("---")
+    st.subheader(tr("Contractual cadence"))
+    a, b = st.columns(2)
+    with a:
+        st.markdown(f"**{tr('Weekly lab → CRO')}**")
+        st.dataframe(get_weekly_ingestion_compliance(conn, n_weeks=8), use_container_width=True, hide_index=True)
+    with b:
+        st.markdown(f"**{tr('Monthly CRO → sponsor')}**")
+        st.dataframe(get_monthly_vinc_compliance(conn, n_months=6), use_container_width=True, hide_index=True)
 
-    with col_right:
-        oor_by_site = df.groupby("site_name").apply(
-            lambda g: (g["Alerte"] == OOR_FLAG).sum() / len(g) * 100
-        ).reset_index(name="outlier_pct")
-        fig_site = px.bar(oor_by_site, x="site_name", y="outlier_pct",
-                           title="<b>Outlier rate by site (%)</b>", text_auto=".1f",
-                           color_discrete_sequence=["#1B4F72"])
-        fig_site.update_layout(xaxis_title=None, yaxis_title="Rate (%)", xaxis_tickangle=0,
-                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                                margin=dict(l=20, r=20, t=40, b=20), height=340)
-        fig_site.update_traces(textposition="outside")
-        st.plotly_chart(fig_site, use_container_width=True)
+    st.markdown("---")
+    st.subheader(tr("Document archive"))
+    if not archive_years:
+        st.info(tr("No archived documents"))
+    else:
+        ac1, ac2, ac3 = st.columns([1,1,1.4])
+        with ac1:
+            y = st.selectbox(tr("Archive year"), archive_years, key="dash_archive_year")
+        with ac2:
+            weeks = available_archive_weeks(conn, y)
+            w = st.selectbox(tr("ISO week"), weeks, key="dash_archive_week")
+        with ac3:
+            stakeholders = ["All"] + sorted([r[0] for r in conn.execute("SELECT DISTINCT stakeholder FROM ARCHIVE_ENTRIES WHERE archive_year=? AND iso_week=? ORDER BY stakeholder", (y,w)).fetchall()])
+            s = st.selectbox(tr("Stakeholder"), stakeholders, key="dash_archive_stakeholder")
+        adf = list_archive(conn, y, w, s)
+        st.dataframe(adf, use_container_width=True, hide_index=True)
+        bundle = build_archive_bundle(conn, y, w)
+        if bundle:
+            st.info(f"Archive path: {bundle['root']}/ · {bundle['record_count']} artifact(s)")
+            if st.download_button(tr("Build weekly archive bundle"), bundle["bytes"], file_name=bundle["filename"], mime="application/zip", key="dash_weekly_archive"):
+                log_audit(conn, "ARCHIVE_ENTRIES", "ARCHIVE_BUNDLE_DOWNLOADED", st.session_state.get("auth_username","system"), record_ref=bundle["filename"], comment=bundle["root"])
 
-    st.subheader("Detailed data")
-    st.dataframe(df, use_container_width=True)
+    st.markdown("---")
+    st.subheader(tr("Sponsor archive"))
+    sponsor_years = available_sponsor_years(conn)
+    if not sponsor_years:
+        st.info(tr("No sponsor archive documents"))
+    else:
+        sa1, sa2, sa3, sa4 = st.columns([1, 0.8, 1, 1.6])
+        with sa1:
+            sy = st.selectbox(tr("Archive year"), sponsor_years, key="dash_sponsor_year")
+        quarters = available_sponsor_quarters(conn, sy)
+        with sa2:
+            sq = st.selectbox(tr("Quarter"), quarters, key="dash_sponsor_quarter")
+        months = available_sponsor_months(conn, sy, sq)
+        with sa3:
+            month_options = [0] + months
+            sm = st.selectbox(tr("Month"), month_options, format_func=lambda m: tr("All months") if m == 0 else f"{int(m):02d}", key="dash_sponsor_month")
+        with sa4:
+            sstake = st.selectbox(tr("Stakeholder"), ["All", "Clinical_Services", "LPH_Sponsor"], key="dash_sponsor_stakeholder")
+        sponsor_df = list_sponsor_archive(conn, sy, sq, None if sm == 0 else sm, sstake)
+        if sponsor_df.empty:
+            st.info(tr("No sponsor archive documents"))
+        else:
+            shown = sponsor_df[["archive_date","logical_path","stakeholder","document_type","filename","sha256","created_by","created_at"]].copy()
+            st.dataframe(shown, use_container_width=True, hide_index=True)
+            sbundle = build_sponsor_archive_bundle(conn, sy, sq, None if sm == 0 else sm)
+            if sbundle:
+                st.info(f"Archive tree: {sbundle['root']}/ · {sbundle['record_count']} artifact(s)")
+                if st.download_button(tr("Build sponsor archive bundle"), sbundle["bytes"], file_name=sbundle["filename"], mime="application/zip", key="dash_sponsor_archive"):
+                    log_audit(conn, "ARCHIVE_ENTRIES", "SPONSOR_ARCHIVE_BUNDLE_DOWNLOADED", st.session_state.get("auth_username","system"), record_ref=sbundle["filename"], comment=sbundle["root"])
 
 
 def page_patient_search(conn):
-    st.title("PATIENT SEARCH")
+    st.title(tr("PATIENT SEARCH", "PATIENT SEARCH"))
     st.caption("Global search across all patients, visits, results and notes — "
                 "or scan a sample barcode directly.")
     query = st.text_input("Search", placeholder="e.g. BLOOD-FR-001, HBA1C, FR-002, or scan a sample barcode...")
@@ -838,7 +937,7 @@ def page_patient_search(conn):
 
 
 def page_patients(conn):
-    st.title("PATIENT FOLLOW-UP")
+    st.title(tr("PATIENT FOLLOW-UP", "PATIENT FOLLOW-UP"))
     df = read_full_results(conn)
     matrix = build_patients_matrix(df)
     if matrix.empty:
@@ -849,7 +948,7 @@ def page_patients(conn):
 
 
 def page_patient_records(conn, user_name, role):
-    st.title("PATIENT RECORDS")
+    st.title(tr("PATIENT RECORDS", "PATIENT RECORDS"))
     render_critical_alert_banner(conn)
 
     df = read_full_results(conn)
@@ -925,7 +1024,7 @@ def page_patient_records(conn, user_name, role):
 
 def page_hl7_import(conn, user_name):
     """Import of results via an HL7 v2 message (ORU^R01). The parser does not provide a real-time MLLP/RS-232 listener."""
-    st.title("HL7 IMPORT")
+    st.title(tr("HL7 IMPORT", "HL7 IMPORT"))
     st.caption("Imports an HL7 v2.x message (ORU^R01 segment) exported from an analyzer or "
                 "an existing LIS. Mapping to the study visits (VINC/V1/V2) is "
                 "selected below because HL7 does not know the study visit plan.")
@@ -996,6 +1095,20 @@ def page_hl7_import(conn, user_name):
 
                 log_audit(conn, "LAB_RESULTS", "INGESTION_HL7", user_name,
                           record_ref=usubjid, comment=f"{len(parsed.observations)} results")
+                archive_dt = None
+                try:
+                    msh = raw_text.splitlines()[0].split("|")
+                    msh7 = (msh[6] if len(msh) > 6 else "")[:14]
+                    archive_dt = datetime.strptime(msh7, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    archive_dt = None
+                archive_document(
+                    conn, uploaded_file.getvalue(), uploaded_file.name or "uploaded.hl7",
+                    stakeholder="Central_Lab_Results", direction="INBOUND", document_type="HL7",
+                    created_by=user_name, related_id=usubjid,
+                    description="HL7 ORU^R01 source message received by Clinical Services CRO; archived by message timestamp.",
+                    archive_datetime=archive_dt, mimetype="text/plain"
+                )
                 st.success(f"{len(parsed.observations)} result(s) imported for {usubjid}, "
                            "status PENDING (technical validation required).")
                 st.rerun()
@@ -1003,7 +1116,7 @@ def page_hl7_import(conn, user_name):
 
 def page_data_privacy(conn, user_name):
     """Privacy controls (data export, pseudonymisation and consent logging). These application controls do not replace compliant hosting for real patient health data."""
-    st.title("DATA PRIVACY (RGPD)")
+    st.title(tr("DATA PRIVACY (RGPD)", "DATA PRIVACY (RGPD)"))
 
     tab_export, tab_anon, tab_consent = st.tabs(
         ["Access right (export)", "Pseudonymisation", "Consent log"])
@@ -1064,7 +1177,7 @@ def page_data_privacy(conn, user_name):
 
 
 def page_export_sdtm(conn, user_name):
-    st.title("CDISC SDTM EXPORT")
+    st.title(tr("CDISC SDTM EXPORT", "CDISC SDTM EXPORT"))
     st.caption("LB (Laboratory) and DM (Demographics) domains, plus a starter define.xml. "
                 "See the Define-XML file itself for the disclaimer on what still needs to be "
                 "completed before a real regulatory submission.")
@@ -1121,7 +1234,7 @@ def page_user_management(conn, user_name):
     """CRO-only: create, deactivate, change role,
     reset passwords. Without this page, the only way
     to add a user would be to edit schema.sql manually."""
-    st.title("USER MANAGEMENT")
+    st.title(tr("USER MANAGEMENT", "USER MANAGEMENT"))
     st.caption("Manage accounts for all roles. Passwords are never shown except once, "
                 "right after creation or reset — write it down or share it securely, "
                 "it cannot be retrieved again.")
@@ -1207,135 +1320,8 @@ def page_user_management(conn, user_name):
                     st.code(temp_password)
 
 
-
-def page_data_correction(conn, user_name):
-    """CRO-only controlled correction/void page.
-
-    The original record is never overwritten. A correction creates a new
-    PENDING version linked through supersedes_result_id; a void marks the
-    active record VOID. Both actions require a documented reason and are
-    recorded in the immutable audit trail by the database layer.
-    """
-    st.title("DATA CORRECTION / VOID")
-    st.caption(
-        "Controlled post-entry changes. The original record is preserved; "
-        "corrections create a new PENDING version and voids make the active "
-        "record ineligible for official exports. A documented reason is mandatory."
-    )
-
-    active_df = read_full_results(conn)
-    if active_df.empty:
-        st.info("No active laboratory results are available.")
-        return
-
-    # Only active records are actionable. Historical versions remain visible
-    # below after an operation for traceability.
-    st.subheader("Select an active result")
-    active_df = active_df.copy()
-    active_df["display_label"] = active_df.apply(
-        lambda r: (
-            f"#{int(r['result_id'])} — {r['usubjid']} — "
-            f"{r['visit_code']} — {r['test_code']} — {r['result_value']} {r['result_unit'] or ''}"
-        ), axis=1,
-    )
-    labels = active_df["display_label"].tolist()
-    choice = st.selectbox("Result", labels, key="correction_result_select")
-    result_id = int(choice.split(" — ")[0].lstrip("#"))
-    selected = active_df[active_df["result_id"] == result_id].iloc[0]
-
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Subject", selected["usubjid"])
-        c2.metric("Visit", selected["visit_code"])
-        c3.metric("Test", selected["test_code"])
-        c4.metric("Current value", f"{selected['result_value']} {selected['result_unit'] or ''}")
-        st.write(
-            f"**Status:** {selected['status']} · **Record status:** {selected['record_status']} · "
-            f"**Result date:** {selected['result_date']}"
-        )
-
-    st.markdown("---")
-    col_correct, col_void = st.columns(2)
-
-    with col_correct:
-        st.subheader("Create a corrected version")
-        try:
-            current_value = float(selected["result_value"])
-        except (TypeError, ValueError):
-            current_value = 0.0
-        new_value = st.number_input(
-            "Corrected result value",
-            value=current_value,
-            format="%.6g",
-            key="correction_new_value",
-        )
-        correction_reason = st.text_area(
-            "Documented reason (mandatory)",
-            placeholder=(
-                "Example: Source laboratory correction received; the original result "
-                "was transcribed incorrectly."
-            ),
-            key="correction_reason",
-        )
-        if st.button("Create corrected version", type="primary", key="btn_create_correction"):
-            if not correction_reason.strip():
-                st.error("A documented change reason is required.")
-            elif float(new_value) == current_value:
-                st.error("Enter a corrected value different from the current value.")
-            else:
-                try:
-                    new_id = create_result_correction(
-                        conn, result_id, float(new_value), correction_reason, user_name
-                    )
-                    st.success(
-                        f"Correction created as result #{new_id}. The original result #{result_id} "
-                        "is preserved as SUPERSEDED and the new version is PENDING."
-                    )
-                    st.rerun()
-                except (ValueError, sqlite3.Error) as exc:
-                    st.error(f"Correction could not be created: {exc}")
-
-    with col_void:
-        st.subheader("Void the active result")
-        void_reason = st.text_area(
-            "Void reason (mandatory)",
-            placeholder=(
-                "Example: Result invalidated by the source laboratory; replacement "
-                "result will be transmitted in a subsequent file."
-            ),
-            key="void_reason",
-        )
-        if st.button("Void active result", key="btn_void_result"):
-            if not void_reason.strip():
-                st.error("A documented void reason is required.")
-            else:
-                try:
-                    void_result(conn, result_id, void_reason, user_name)
-                    st.success(
-                        f"Result #{result_id} has been voided. It remains traceable but is "
-                        "excluded from official exports."
-                    )
-                    st.rerun()
-                except (ValueError, sqlite3.Error) as exc:
-                    st.error(f"Result could not be voided: {exc}")
-
-    st.markdown("---")
-    st.subheader("Version history")
-    history = read_result_history(conn, result_id)
-    if history.empty:
-        st.info("No history found for the selected result.")
-    else:
-        cols = [
-            c for c in [
-                "result_id", "result_value", "result_unit", "status", "record_status",
-                "supersedes_result_id", "change_reason", "technical_validated_by",
-                "technical_validated_at", "biologist_validated_by", "biologist_validated_at",
-            ] if c in history.columns
-        ]
-        st.dataframe(history[cols], use_container_width=True, hide_index=True)
-
 def page_settings(conn, user_name):
-    st.title("SETTINGS")
+    st.title(tr("SETTINGS", "SETTINGS"))
     st.caption("Customise the look and feel of the app for your business.")
     current_name = get_setting(conn, "company_name") or "Clinical Services"
     current_logo = get_setting(conn, "logo_base64")
@@ -1360,6 +1346,26 @@ def page_settings(conn, user_name):
             st.rerun()
 
     with st.container(border=True):
+        st.subheader("🧪 Demonstration history (training only)")
+        st.caption(
+            "Load a controlled multi-month history into an empty training database. "
+            "This creates chronological import batches, mixed workflow states, critical alerts and archive entries. "
+            "Never use this feature with real study data."
+        )
+        auto_history = get_setting(conn, "demo_history_auto_load", "0") == "1"
+        new_auto_history = st.toggle("Auto-load historical demo data when the database is empty", value=auto_history)
+        if st.button("Load multi-month demonstration history"):
+            result = load_demo_history(conn)
+            st.success(result["message"])
+            log_audit(conn, "SETTINGS", "LOAD_DEMO_HISTORY", user_name, comment=result["message"])
+            st.rerun()
+        if st.button("Save demo history setting"):
+            set_setting(conn, "demo_history_auto_load", "1" if new_auto_history else "0")
+            log_audit(conn, "SETTINGS", "UPDATE_DEMO_HISTORY_SETTING", user_name, comment=f"auto_load={new_auto_history}")
+            st.success("Demo history setting saved.")
+            st.rerun()
+
+    with st.container(border=True):
         st.subheader("Backup")
         st.caption("Download a full snapshot of the database file (SQLite). "
                     "Recommended policy: at least weekly, stored somewhere other than "
@@ -1376,11 +1382,12 @@ def page_settings(conn, user_name):
 
 
 def page_automation(conn, user_name):
-    st.title("AUTOMATION")
+    st.title(tr("AUTOMATION", "AUTOMATION"))
     st.caption(
         "The free Streamlit deployment does not provide a persistent server-side scheduler. "
         "This application therefore evaluates automation rules on page load and provides a controlled "
-        "manual/demo runner. All sends are recorded in AUTOMATION_RUNS and the Audit Trail."
+        "manual/demo runner. All sends are recorded in AUTOMATION_RUNS and the Audit Trail. "
+        "Inbound laboratory files and outbound sponsor packages are also archived automatically by ISO year/week."
     )
 
     enabled = get_setting(conn, "automation_enabled", "1") == "1"
@@ -1469,8 +1476,56 @@ def page_automation(conn, user_name):
 
     st.info(
         "Recommended presentation setup: Demo clock ON, reference date 2026-06-25, last ingestion date 2026-06-18, "
-        "sponsor recipient = sponsor_lph. Then preview, run the automation, and open the sponsor Mailbox to show the ZIP attachment."
+        "sponsor recipient = sponsor_lph. Then preview, run the automation, and open the sponsor Mailbox to show the ZIP attachment. "
+        "The system now archives inbound laboratory files, outbound sponsor packages and automation run reports by ISO year/week."
     )
+
+    # Archive controls stay inside Automation so no additional page is added.
+    st.markdown("---")
+    st.subheader("📁 CRO working archive — ISO year / ISO week")
+    archive_years = available_archive_years(conn)
+    if archive_years:
+        cy, cw = st.columns(2)
+        with cy:
+            ay = st.selectbox("Archive year", archive_years, key="automation_archive_year")
+        with cw:
+            aws = available_archive_weeks(conn, ay)
+            aw = st.selectbox("ISO week", aws, key="automation_archive_week")
+        entries = list_archive(conn, ay, aw)
+        st.caption(f"Logical archive: {ay}/W{aw:02d}/ · {len(entries)} artifact(s)")
+        st.dataframe(entries, use_container_width=True, hide_index=True)
+        bundle = build_archive_bundle(conn, ay, aw)
+        if bundle:
+            st.download_button("Download CRO weekly archive ZIP", bundle["bytes"], file_name=bundle["filename"], mime="application/zip", key="automation_archive_download")
+    else:
+        st.info("No archive artifacts yet. Import a laboratory file to create the first archive entry.")
+
+    st.markdown("---")
+    st.subheader("📦 Sponsor archive — year / quarter / month")
+    sponsor_years = available_sponsor_years(conn)
+    if sponsor_years:
+        sa1, sa2, sa3, sa4 = st.columns([1, 0.8, 1, 1.4])
+        with sa1:
+            sy = st.selectbox("Calendar year", sponsor_years, key="automation_sponsor_year")
+        sqs = available_sponsor_quarters(conn, sy)
+        with sa2:
+            sq = st.selectbox("Quarter", sqs, key="automation_sponsor_quarter")
+        sms = available_sponsor_months(conn, sy, sq)
+        with sa3:
+            sm = st.selectbox("Month", [0] + sms, format_func=lambda m: "All months" if m == 0 else f"{int(m):02d}", key="automation_sponsor_month")
+        with sa4:
+            sstake = st.selectbox("Stakeholder", ["All", "Clinical_Services", "LPH_Sponsor"], key="automation_sponsor_stakeholder")
+        sponsor_df = list_sponsor_archive(conn, sy, sq, None if sm == 0 else sm, sstake)
+        st.caption(f"Logical sponsor archive: {sy}/Q{sq}/" + ("" if sm == 0 else f"{sy}-{int(sm):02d}/") + f" · {len(sponsor_df)} artifact(s)")
+        if not sponsor_df.empty:
+            st.dataframe(sponsor_df[["archive_date","logical_path","stakeholder","document_type","filename","sha256"]], use_container_width=True, hide_index=True)
+            sbundle = build_sponsor_archive_bundle(conn, sy, sq, None if sm == 0 else sm)
+            if sbundle:
+                st.download_button("Download sponsor archive ZIP", sbundle["bytes"], file_name=sbundle["filename"], mime="application/zip", key="automation_sponsor_archive_download")
+        else:
+            st.info("No sponsor archive artifacts for this period.")
+    else:
+        st.info("No sponsor-facing archive artifacts yet. Generate a monthly VINC package to create them.")
 
     st.markdown("---")
     st.subheader("🔍 Preview")
@@ -1523,7 +1578,7 @@ def page_automation(conn, user_name):
 
 
 def page_audit_trail(conn):
-    st.title("AUDIT TRAIL")
+    st.title(tr("AUDIT TRAIL", "AUDIT TRAIL"))
     st.caption("Timestamping in UTC. This log can only be added to: it cannot be edited, "
                 "deleted, nor disabled — enforced at the database level "
                 "(triggers trg_audit_no_update / trg_audit_no_delete), not merely by "
@@ -1536,7 +1591,7 @@ def page_audit_trail(conn):
 
 
 def page_extraction_vinc(conn, user_name, role):
-    st.title("VINC VISIT RESULTS")
+    st.title(tr("VINC VISIT RESULTS", "VINC VISIT RESULTS"))
     render_sponsor_reminder(conn)
     df = read_full_results(conn)
     all_vinc = df[df["visit_code"] == "VINC"].copy()
@@ -1574,6 +1629,16 @@ def page_extraction_vinc(conn, user_name, role):
         f"Package SHA-256: {package['package_sha256']}"
     )
 
+    # Archive the generated sponsor package automatically; the same SHA-256 prevents duplicate archive entries.
+    archive_document(
+        conn, package["package_bytes"], package["filename"],
+        stakeholder="Clinical_Services", direction="OUTBOUND", document_type="VINC_PACKAGE",
+        created_by=user_name, related_id=package["package_id"],
+        description="Monthly reviewed VINC package automatically archived for CRO and sponsor retrieval.",
+        archive_datetime=datetime.combine(cutoff_date, datetime.min.time(), tzinfo=timezone.utc),
+        mimetype="application/zip",
+    )
+
     # Keep the package ledger in the database only when the user is allowed to generate it.
     package_registered = conn.execute(
         "SELECT 1 FROM EXPORT_PACKAGES WHERE package_id = ?", (package["package_id"],)
@@ -1592,6 +1657,12 @@ def page_extraction_vinc(conn, user_name, role):
     ):
         from db import mark_export_package_downloaded
         mark_export_package_downloaded(conn, package["package_id"], user_name)
+        archive_document(
+            conn, package["package_bytes"], package["filename"],
+            stakeholder="Clinical_Services", direction="OUTBOUND", document_type="VINC_PACKAGE",
+            created_by=user_name, related_id=package["package_id"],
+            description="Reviewed VINC package generated for sponsor delivery / demonstration.", mimetype="application/zip"
+        )
         action = "CONSULTATION_VINC_SPONSOR" if role == "SPONSOR" else "EXPORT_VINC_CRO"
         log_audit(
             conn, "EXPORT_PACKAGES", action, user_name, record_ref=package["package_id"],
@@ -1603,6 +1674,12 @@ def page_extraction_vinc(conn, user_name, role):
         "📄 Download reviewed VINC PDF", pdf_bytes,
         file_name=f"BLOOD_VINC_{cutoff_date}.pdf", mime="application/pdf", key="dl_vinc_pdf"
     ):
+        archive_document(
+            conn, pdf_bytes, f"BLOOD_VINC_{cutoff_date}.pdf",
+            stakeholder="Clinical_Services", direction="OUTBOUND", document_type="VINC_PDF",
+            created_by=user_name, related_id=package["package_id"],
+            description="Reviewed VINC PDF report for sponsor delivery / demonstration.", mimetype="application/pdf"
+        )
         log_audit(
             conn, "EXPORT_PACKAGES", "EXPORT_PDF_VINC_SPONSOR" if role == "SPONSOR" else "EXPORT_PDF_VINC_CRO",
             user_name, record_ref=package["package_id"], comment=f"rows={package['row_count']}"
@@ -1610,7 +1687,7 @@ def page_extraction_vinc(conn, user_name, role):
 
 
 def page_remarks(conn, user_name, role):
-    st.title("RESULT COMMENTS")
+    st.title(tr("RESULT COMMENTS", "RESULT COMMENTS"))
     df = read_full_results(conn)
 
     if role in ("BIOLOGIST", "PHYSICIAN", "CRO"):
@@ -1647,6 +1724,15 @@ def main():
     inject_custom_css()
     conn = get_connection()
 
+    # Optional training convenience: bootstrap a populated multi-month history
+    # only when explicitly enabled and the result table is empty.
+    if get_setting(conn, "demo_history_auto_load", "0") == "1":
+        try:
+            if read_full_results(conn).empty:
+                load_demo_history(conn)
+        except Exception as exc:
+            log_audit(conn, "SETTINGS", "DEMO_HISTORY_AUTO_LOAD_FAILED", "system", comment=str(exc))
+
     # Si l'URL contient ?reset_token=..., on affiche le formulaire de
     # réinitialisation et on s'arrête là (rien d'autre ne doit se
     # rendre tant que ce n'est pas résolu).
@@ -1677,12 +1763,12 @@ def main():
     unread = count_unread(conn, username)
 
     def _format_page_label(p):
-        label = f"{PAGE_ICONS.get(p, '')} {p}"
+        label = f"{PAGE_ICONS.get(p, '')} {translate_page(p)}"
         if p == "Mailbox" and unread:
             label += f" ({unread})"
         return label
 
-    page = st.sidebar.radio("Navigation", allowed_pages, format_func=_format_page_label)
+    page = st.sidebar.radio(tr("Navigation"), allowed_pages, format_func=_format_page_label)
     st.sidebar.markdown("---")
     st.sidebar.caption("Access in accordance with the principle of least privilege "
                         "(21 CFR Part 11 / Annex 11 §12). "

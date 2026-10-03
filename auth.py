@@ -23,11 +23,29 @@ import streamlit as st
 from audit import log_audit
 from constants import (LOGIN_LOCKOUT_MINUTES, LOGIN_LOCKOUT_THRESHOLD,
                         PASSWORD_RESET_TOKEN_MINUTES, ROLE_LABELS)
+from i18n import SUPPORTED_LANGUAGES, get_language, set_language, tr
 from db import (clear_must_change_password, consume_password_reset_token,
                 create_password_reset_token, find_user_by_username_or_email,
                 record_login_failure, record_login_success)
 
 SESSION_TIMEOUT_MINUTES = 30
+
+
+def _render_language_selector():
+    """Render a compact language selector before login and after authentication."""
+    labels = list(SUPPORTED_LANGUAGES.keys())
+    current = get_language()
+    current_label = next((label for label, code in SUPPORTED_LANGUAGES.items() if code == current), labels[0])
+    selected = st.sidebar.selectbox(
+        tr("Language", "Language"),
+        labels,
+        index=labels.index(current_label),
+        key="ui_language_selector",
+    )
+    selected_code = SUPPORTED_LANGUAGES[selected]
+    if selected_code != current:
+        set_language(selected_code)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------
@@ -194,6 +212,12 @@ def _render_forgot_password(conn):
 # Connexion / sidebar
 # ---------------------------------------------------------------------
 def sidebar_user_identification(conn):
+    _render_language_selector()
+    logo_path = "assets/logo_clinical_services.png"
+    try:
+        st.sidebar.image(logo_path, width=185)
+    except Exception:
+        pass
     st.sidebar.markdown('<div class="sidebar-login-title">🫆 Identifiant</div>',
                          unsafe_allow_html=True)
 

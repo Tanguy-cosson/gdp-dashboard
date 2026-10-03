@@ -18,6 +18,7 @@ def log_audit(
     reason=None,
     object_type=None,
     object_id=None,
+    event_timestamp=None,
 ):
     # Backward-compatible writer: legacy databases may temporarily expose only
     # the original audit columns while migrations are being applied. We insert
@@ -27,7 +28,7 @@ def log_audit(
         "table_name": table_name,
         "action": action,
         "user_name": user_name,
-        "event_timestamp": now_utc_iso(),
+        "event_timestamp": event_timestamp or now_utc_iso(),
         "record_ref": record_ref,
         "comment": comment,
         "old_value": old_value,

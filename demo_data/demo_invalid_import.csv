@@ -1,0 +1,2 @@
+site_id,patient_id,usubjid,subjid,birth_year,visit_code,visit_date,visit_num,sample_type,collection_datetime,test_code,test_name,result_value,result_unit,result_date,ref_low,ref_high,critical_low,critical_high
+FR-001,P-DEMO-BAD,BLOOD-DEMO-BAD,999,1978,VINC,2026-09-21,1,SERUM,2026-09-21T08:00:00Z,HBA1C,Hemoglobin A1c,5.7,%,2026-09-21,4.0,6.0,,

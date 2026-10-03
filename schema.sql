@@ -191,7 +191,6 @@ BEGIN
 END;
 
 CREATE INDEX IF NOT EXISTS idx_lab_results_status ON LAB_RESULTS(status);
-CREATE INDEX IF NOT EXISTS idx_lab_results_record_status ON LAB_RESULTS(record_status);
 CREATE INDEX IF NOT EXISTS idx_lab_results_import_batch ON LAB_RESULTS(import_batch_id);
 CREATE INDEX IF NOT EXISTS idx_lab_results_supersedes ON LAB_RESULTS(supersedes_result_id);
 CREATE INDEX IF NOT EXISTS idx_audit_event_timestamp ON AUDIT_TRAIL(event_timestamp);
@@ -287,21 +286,3 @@ INSERT OR IGNORE INTO SETTINGS (setting_key, setting_value) VALUES
     ('notify_emails_physician', ''),
     ('auto_send_reports_enabled', '0');
 
-CREATE VIEW IF NOT EXISTS V_LAB_RESULTS_FULL AS
-SELECT lr.result_id, p.usubjid, p.patient_id, p.sex, p.birth_year,
-       s.site_id, s.site_name, s.country,
-       v.visit_code, v.visit_num, v.visit_date,
-       lr.sample_id, sa.sample_type, sa.collection_datetime, sa.receipt_datetime,
-       sa.barcode_value, sa.status AS sample_status,
-       lr.test_code, lr.test_name, lr.result_value, lr.result_unit, lr.result_date,
-       lr.ref_low, lr.ref_high, lr.critical_low, lr.critical_high,
-       lr.status, lr.record_status, lr.supersedes_result_id, lr.change_reason,
-       lr.import_batch_id, lr.lab_source,
-       lr.technical_validated_by, lr.technical_validated_at,
-       lr.biologist_validated_by, lr.biologist_validated_at,
-       lr.signature_reason, lr.remarks
-FROM LAB_RESULTS lr
-JOIN VISITES v ON lr.visit_id = v.visit_id
-JOIN PATIENTS p ON v.patient_id = p.patient_id
-JOIN SITES s ON p.site_id = s.site_id
-LEFT JOIN SAMPLES sa ON lr.sample_id = sa.sample_id;

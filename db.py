@@ -20,62 +20,6 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blood_study.
 SCHEMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 
-def _split_sql_statements(script: str):
-    """Split a SQLite script into complete statements without breaking triggers."""
-    statements = []
-    buffer = []
-    for line in script.splitlines(True):
-        buffer.append(line)
-        candidate = "".join(buffer)
-        if sqlite3.complete_statement(candidate):
-            statement = candidate.strip()
-            if statement:
-                statements.append(statement)
-            buffer = []
-    if "".join(buffer).strip():
-        raise sqlite3.DatabaseError("Incomplete SQL statement in schema.sql")
-    return statements
-
-
-def _initialize_schema(conn):
-    """Initialize a new DB and safely upgrade legacy DBs.
-
-    Indexes and views are deliberately created *after* migrations. Older
-    databases may not yet contain columns such as record_status, and SQLite
-    would otherwise fail while executing CREATE INDEX before the migration
-    layer gets a chance to add those columns.
-    """
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-        script = f.read()
-
-    statements = _split_sql_statements(script)
-    deferred = []
-    immediate = []
-
-    for statement in statements:
-        normalized = statement.lstrip().upper()
-        if normalized.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX", "CREATE VIEW")):
-            deferred.append(statement)
-        else:
-            immediate.append(statement)
-
-    # First create/seed the structural objects. This is safe for both fresh
-    # and legacy databases because schema.sql uses IF NOT EXISTS semantics.
-    for statement in immediate:
-        conn.executescript(statement)
-    conn.commit()
-
-    # Apply versioned migrations before any object can reference newly added
-    # columns. Import is intentionally deferred to avoid a circular import.
-    from migrations import run_migrations
-    run_migrations(conn)
-
-    # Finally create indexes/views against the now-current schema.
-    for statement in deferred:
-        conn.executescript(statement)
-    conn.commit()
-
-
 @st.cache_resource
 def get_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -83,7 +27,16 @@ def get_connection():
     conn.execute("PRAGMA busy_timeout = 5000;")
     conn.execute("PRAGMA synchronous = FULL;")
     conn.execute("PRAGMA journal_mode = WAL;")
-    _initialize_schema(conn)
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        conn.executescript(f.read())
+    conn.commit()
+
+    # Rattrape le schéma des bases créées par une version antérieure de
+    # schema.sql (voir migrations.py). Import différé pour éviter un
+    # cycle (migrations.py importe get_setting/set_setting d'ici).
+    from migrations import run_migrations
+    run_migrations(conn)
+
     return conn
 
 
@@ -315,8 +268,13 @@ def insert_lab_result(conn, visit_id, test_code, test_name, value, unit, result_
     return result_id
 
 
-def import_lab_results_batch(conn, df, user_name, source_filename, source_sha256):
-    """Import CSV all-or-nothing with file lineage and duplicate protection."""
+def import_lab_results_batch(conn, df, user_name, source_filename, source_sha256, received_at=None):
+    """Import CSV all-or-nothing with file lineage and duplicate protection.
+
+    ``received_at`` is optional and intended for controlled demonstration/history
+    data. In production the reception timestamp should be the actual server-side
+    receipt time from the approved transfer channel.
+    """
     # Exact file already accepted: idempotent replay.
     existing_batch = conn.execute(
         "SELECT batch_id, imported_rows, skipped_rows FROM IMPORT_BATCHES "
@@ -327,10 +285,19 @@ def import_lab_results_batch(conn, df, user_name, source_filename, source_sha256
         return existing_batch[0], 0, int(existing_batch[2] or existing_batch[1] or len(df))
 
     batch_id = f"IMP-{uuid.uuid4().hex[:12].upper()}"
+    received_at_iso = now_utc_iso()
+    if received_at:
+        try:
+            parsed = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            received_at_iso = parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+        except ValueError:
+            raise ValueError(f"Invalid source_received_datetime: {received_at}")
     conn.execute(
         "INSERT INTO IMPORT_BATCHES (batch_id, source_filename, source_sha256, received_at, "
         "received_by, row_count, status) VALUES (?, ?, ?, ?, ?, ?, 'RECEIVED')",
-        (batch_id, source_filename, source_sha256, now_utc_iso(), user_name, len(df)),
+        (batch_id, source_filename, source_sha256, received_at_iso, user_name, len(df)),
     )
     conn.commit()
 
@@ -393,7 +360,7 @@ def import_lab_results_batch(conn, df, user_name, source_filename, source_sha256
                     conn.execute(
                         "INSERT INTO SAMPLES (sample_id, patient_id, visit_id, sample_type, collection_datetime, "
                         "receipt_datetime, status, barcode_value) VALUES (?, ?, ?, ?, ?, ?, 'RECEIVED', ?)",
-                        (sample_id, patient_id, visit_id, sample_type, collection_dt, now_utc_iso(), sample_id),
+                        (sample_id, patient_id, visit_id, sample_type, collection_dt, received_at_iso, sample_id),
                     )
 
                 ref_low = float(row["ref_low"]) if "ref_low" in df.columns and pd.notna(row["ref_low"]) else None
@@ -444,7 +411,7 @@ def import_lab_results_batch(conn, df, user_name, source_filename, source_sha256
     log_audit(
         conn, "IMPORT_BATCHES", "INGESTION_CSV", user_name, record_ref=batch_id,
         comment=f"filename={source_filename}; sha256={source_sha256}; rows={len(df)}; inserted={inserted}; skipped={skipped}",
-        object_type="IMPORT_BATCH", object_id=batch_id,
+        object_type="IMPORT_BATCH", object_id=batch_id, event_timestamp=received_at_iso,
     )
     return batch_id, inserted, skipped
 

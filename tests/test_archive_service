@@ -1,0 +1,59 @@
+import sqlite3
+from datetime import datetime, timezone
+
+from archive_service import archive_document, available_archive_weeks, build_archive_bundle, list_archive
+
+
+def _conn():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE ARCHIVE_ENTRIES (
+            archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            archive_date TEXT NOT NULL,
+            archive_year INTEGER NOT NULL,
+            iso_week INTEGER NOT NULL,
+            week_key TEXT NOT NULL,
+            stakeholder TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            document_type TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            content BLOB NOT NULL,
+            mimetype TEXT,
+            related_id TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            description TEXT
+        )
+    """)
+    return conn
+
+
+def test_archive_is_deduplicated_and_retrievable():
+    conn = _conn()
+    when = datetime(2026, 6, 22, 12, tzinfo=timezone.utc)
+    first = archive_document(conn, b"abc", "source.csv", "Central_Lab_Results", "INBOUND", "CSV", "lab_tech1", archive_datetime=when)
+    second = archive_document(conn, b"abc", "source.csv", "Central_Lab_Results", "INBOUND", "CSV", "lab_tech1", archive_datetime=when)
+    assert first == second
+    assert available_archive_weeks(conn, 2026) == [26]
+    df = list_archive(conn, 2026, 26, "Central_Lab_Results")
+    assert len(df) == 1
+    bundle = build_archive_bundle(conn, 2026, 26)
+    assert bundle is not None
+    assert bundle["record_count"] == 1
+    assert bundle["filename"] == "BLOOD_ARCHIVE_2026_W26.zip"
+
+
+def test_sponsor_archive_uses_calendar_year_quarter_month_tree():
+    from archive_service import build_sponsor_archive_bundle, list_sponsor_archive
+    conn = _conn()
+    when = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
+    archive_document(conn, b"zip1", "BLOOD_VINC_2026-06-30.zip", "Clinical_Services", "OUTBOUND", "VINC_PACKAGE", "system", archive_datetime=when)
+    archive_document(conn, b"zip1", "BLOOD_VINC_2026-06-30.zip", "LPH_Sponsor", "INBOUND", "SPONSOR_RECEIPT", "system", archive_datetime=when)
+    df = list_sponsor_archive(conn, 2026, 2, 6)
+    assert len(df) == 2
+    assert all("2026/Q2/2026-06/" in p for p in df["logical_path"].tolist())
+    bundle = build_sponsor_archive_bundle(conn, 2026, 2, 6)
+    assert bundle is not None
+    assert bundle["root"] == "2026/Q2/2026-06"
+    assert bundle["record_count"] == 2

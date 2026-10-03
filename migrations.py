@@ -1,7 +1,9 @@
 """Versioned, idempotent database migrations for the BLOOD LIMS demo.
 
-The migration layer is deliberately explicit: each migration inspects the real
-schema before making a change and writes an audit event after success.
+Derived SQLite objects (indexes/views that depend on migrated columns) are
+rebuilt only after all schema migrations have completed. This is important for
+legacy SQLite databases where the derived objects may still reference an older
+schema.
 """
 from audit import log_audit
 from db import set_setting
@@ -44,7 +46,6 @@ def _migration_1_user_management(conn):
                 FOREIGN KEY (username) REFERENCES USERS(username)
             )
         """)
-    conn.commit()
 
 
 def _migration_2_gdpr_and_hl7(conn):
@@ -63,7 +64,6 @@ def _migration_2_gdpr_and_hl7(conn):
                 FOREIGN KEY (patient_id) REFERENCES PATIENTS(patient_id)
             )
         """)
-    conn.commit()
 
 
 def _migration_3_internal_mailbox(conn):
@@ -85,16 +85,14 @@ def _migration_3_internal_mailbox(conn):
                 FOREIGN KEY (recipient_username) REFERENCES USERS(username)
             )
         """)
-    conn.commit()
 
 
 def _migration_4_audit_record_ref(conn):
     _add_column(conn, "AUDIT_TRAIL", "record_ref TEXT")
-    conn.commit()
 
 
 def _migration_5_gxp_traceability(conn):
-    """Adds result lineage, field-level audit metadata and automation/export ledgers."""
+    """Add result lineage, field-level audit metadata and automation/export ledgers."""
     if _table_exists(conn, "LAB_RESULTS"):
         for definition in [
             "record_status TEXT NOT NULL DEFAULT 'ACTIVE'",
@@ -160,7 +158,9 @@ def _migration_5_gxp_traceability(conn):
             )
         """)
     else:
-        sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='EXPORT_PACKAGES'").fetchone()
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='EXPORT_PACKAGES'"
+        ).fetchone()
         sql = (sql_row[0] or "") if sql_row else ""
         if "'SENT'" not in sql:
             conn.execute("ALTER TABLE EXPORT_PACKAGES RENAME TO EXPORT_PACKAGES_OLD")
@@ -182,10 +182,13 @@ def _migration_5_gxp_traceability(conn):
                 )
             """)
             conn.execute("""
-                INSERT INTO EXPORT_PACKAGES (package_id, package_type, generated_at, generated_by, cutoff_date,
-                    row_count, csv_sha256, package_sha256, filename, status)
-                SELECT package_id, package_type, generated_at, generated_by, cutoff_date, row_count,
-                    csv_sha256, package_sha256, filename, status FROM EXPORT_PACKAGES_OLD
+                INSERT INTO EXPORT_PACKAGES (
+                    package_id, package_type, generated_at, generated_by, cutoff_date,
+                    row_count, csv_sha256, package_sha256, filename, status
+                )
+                SELECT package_id, package_type, generated_at, generated_by, cutoff_date,
+                       row_count, csv_sha256, package_sha256, filename, status
+                FROM EXPORT_PACKAGES_OLD
             """)
             conn.execute("DROP TABLE EXPORT_PACKAGES_OLD")
 
@@ -202,12 +205,9 @@ def _migration_5_gxp_traceability(conn):
             "INSERT OR IGNORE INTO SETTINGS(setting_key, setting_value) VALUES (?, ?)",
             (key, value),
         )
-    conn.commit()
-
 
 
 def _migration_6_english_demo_labels(conn):
-    """Translate the built-in demonstration account labels without touching custom user names."""
     replacements = {
         ("lab_tech1", "Technicien de laboratoire", "Laboratory Technician"),
         ("biologist1", "Dr. Biologiste", "Dr. Biologist"),
@@ -216,8 +216,43 @@ def _migration_6_english_demo_labels(conn):
         ("cro_arc", "ARC - Clinical Services", "CRO - Clinical Services"),
     }
     for username, old_name, new_name in replacements:
-        conn.execute("UPDATE USERS SET full_name=? WHERE username=? AND full_name=?", (new_name, username, old_name))
-    conn.commit()
+        conn.execute(
+            "UPDATE USERS SET full_name=? WHERE username=? AND full_name=?",
+            (new_name, username, old_name),
+        )
+
+
+def _migration_7_archive_repository(conn):
+    if not _table_exists(conn, "ARCHIVE_ENTRIES"):
+        conn.execute("""
+            CREATE TABLE ARCHIVE_ENTRIES (
+                archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                archive_date TEXT NOT NULL,
+                archive_year INTEGER NOT NULL,
+                iso_week INTEGER NOT NULL,
+                week_key TEXT NOT NULL,
+                stakeholder TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                document_type TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BLOB NOT NULL,
+                mimetype TEXT,
+                related_id TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                description TEXT
+            )
+        """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archive_period ON ARCHIVE_ENTRIES(archive_year, iso_week)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archive_stakeholder ON ARCHIVE_ENTRIES(stakeholder, archive_year, iso_week)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_dedupe ON ARCHIVE_ENTRIES(week_key, stakeholder, filename, sha256)"
+    )
 
 
 MIGRATIONS = [
@@ -227,7 +262,38 @@ MIGRATIONS = [
     (4, "audit_record_ref", _migration_4_audit_record_ref),
     (5, "gxp_traceability_and_automation", _migration_5_gxp_traceability),
     (6, "english_demo_labels", _migration_6_english_demo_labels),
+    (7, "document_archive_repository", _migration_7_archive_repository),
 ]
+
+
+def _rebuild_derived_objects(conn):
+    """Rebuild indexes/views that depend on migrated columns after migration."""
+    conn.execute("DROP VIEW IF EXISTS V_LAB_RESULTS_FULL")
+    if _table_exists(conn, "LAB_RESULTS") and _column_exists(conn, "LAB_RESULTS", "record_status"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lab_results_record_status ON LAB_RESULTS(record_status)"
+        )
+    conn.execute("""
+        CREATE VIEW V_LAB_RESULTS_FULL AS
+        SELECT lr.result_id, p.usubjid, p.patient_id, p.sex, p.birth_year,
+               s.site_id, s.site_name, s.country,
+               v.visit_code, v.visit_num, v.visit_date,
+               lr.sample_id, sa.sample_type, sa.collection_datetime, sa.receipt_datetime,
+               sa.barcode_value, sa.status AS sample_status,
+               lr.test_code, lr.test_name, lr.result_value, lr.result_unit, lr.result_date,
+               lr.ref_low, lr.ref_high, lr.critical_low, lr.critical_high,
+               lr.status, lr.record_status, lr.supersedes_result_id, lr.change_reason,
+               lr.import_batch_id, lr.lab_source,
+               lr.technical_validated_by, lr.technical_validated_at,
+               lr.biologist_validated_by, lr.biologist_validated_at,
+               lr.signature_reason, lr.remarks
+        FROM LAB_RESULTS lr
+        JOIN VISITES v ON lr.visit_id = v.visit_id
+        JOIN PATIENTS p ON v.patient_id = p.patient_id
+        JOIN SITES s ON p.site_id = s.site_id
+        LEFT JOIN SAMPLES sa ON lr.sample_id = sa.sample_id
+    """)
+    conn.commit()
 
 
 def run_migrations(conn):
@@ -238,14 +304,36 @@ def run_migrations(conn):
         2: lambda: not _column_exists(conn, "PATIENTS", "anonymized"),
         3: lambda: not _column_exists(conn, "USERS", "job_title"),
         5: lambda: not _column_exists(conn, "LAB_RESULTS", "record_status"),
-        6: lambda: any(r[0] in ("Technicien de laboratoire", "Dr. Biologiste", "Dr. Medecin Investigateur", "Promoteur LPH") for r in conn.execute("SELECT full_name FROM USERS WHERE username IN ('lab_tech1','biologist1','physician1','sponsor_lph')").fetchall()),
+        6: lambda: any(
+            r[0] in (
+                "Technicien de laboratoire",
+                "Dr. Biologiste",
+                "Dr. Medecin Investigateur",
+                "Promoteur LPH",
+            )
+            for r in conn.execute(
+                "SELECT full_name FROM USERS WHERE username IN ('lab_tech1','biologist1','physician1','sponsor_lph')"
+            ).fetchall()
+        ),
+        7: lambda: not _table_exists(conn, "ARCHIVE_ENTRIES"),
     }
+
+    # v4 is idempotently applied before the loop because later migration audit
+    # records rely on record_ref.
     for version, name, fn in MIGRATIONS:
         if version == 4:
             continue
         was_missing = checks.get(version, lambda: True)()
         fn(conn)
         if was_missing:
-            log_audit(conn, "SCHEMA", "MIGRATION_APPLIED", "system", comment=f"v{version}: {name}")
+            log_audit(
+                conn,
+                "SCHEMA",
+                "MIGRATION_APPLIED",
+                "system",
+                comment=f"v{version}: {name}",
+            )
         set_setting(conn, "schema_version", str(version))
-    set_setting(conn, "schema_version", "6")
+
+    _rebuild_derived_objects(conn)
+    set_setting(conn, "schema_version", "7")

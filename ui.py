@@ -6,6 +6,7 @@ import os
 import streamlit as st
 
 from constants import DEMO_ACCOUNTS
+from i18n import tr
 from db import get_setting
 
 
@@ -62,8 +63,8 @@ def load_image_base64(relative_path):
 def inject_custom_css():
     st.markdown("""
     <style>
-    [data-testid="stMainBlockContainer"] { padding-top: 0.8rem !important; }
-    .block-container { padding-top: 0 !important; }
+    [data-testid="stMainBlockContainer"] { padding-top: 1.1rem !important; }
+    .block-container { padding-top: 0.35rem !important; }
     body { overflow-x: hidden; }
     [data-testid="stSidebar"] { background: #123C5A; border-right: 1px solid #0D2C42; }
     [data-testid="stSidebar"] * { color: #FFFFFF !important; }
@@ -120,11 +121,11 @@ def inject_custom_css():
     .hero-banner {
         position: relative; overflow: hidden;
         background: linear-gradient(135deg, #123C5A 0%, #1B6EA5 100%);
-        border-radius: 0 10px 10px 0; padding: 1.8rem 3rem 1.8rem 2rem;
-        margin-left: -1rem; margin-right: -1rem; margin-top: 0; margin-bottom: 1.4rem;
-        width: calc(100% + 2rem); min-height: 120px; box-sizing: border-box;
+        border-radius: 0 10px 10px 0; padding: 1.95rem 2.5rem 1.7rem 1.8rem;
+        margin-left: -1rem; margin-right: -1rem; margin-top: 0.45rem; margin-bottom: 1.35rem;
+        width: calc(100% + 2rem); min-height: 118px; box-sizing: border-box;
     }
-    .hero-banner h1 { color: #FFFFFF; font-size: 2.1rem; font-weight: 800; margin: 0 0 0.2rem 0; }
+    .hero-banner h1 { color: #FFFFFF; font-size: 2.1rem; line-height: 1.18; font-weight: 800; margin: 0 0 0.2rem 0; }
     .hero-banner p { color: #DCEBF7; font-size: 1rem; margin: 0; position: relative; z-index: 2; }
     .hero-network {
         position: absolute; top: -10px; right: -10px; width: 52%; height: 180%;
@@ -163,6 +164,26 @@ def inject_custom_css():
     }
     .kpi-card .kpi-value { font-size: 1.9rem; font-weight: 800; color: #1B2631; line-height: 1.1; }
     .kpi-card .kpi-icon { font-size: 1.3rem; float: right; opacity: 0.7; }
+    [data-testid="stMetric"] {
+        background:#FFFFFF; border:1px solid #E3E8EE; border-radius:12px;
+        padding:0.65rem 0.8rem; box-shadow:0 1px 3px rgba(0,0,0,0.04);
+    }
+    div[data-testid="stDataFrame"] {
+        border:1px solid #E3E8EE; border-radius:10px; overflow:hidden;
+    }
+    details[data-testid="stExpander"] {
+        border:1px solid #E3E8EE; border-radius:10px; background:#FFFFFF;
+    }
+    .stTabs [data-baseweb="tab-list"] { gap:0.3rem; }
+    .stTabs [data-baseweb="tab"] { padding:0.55rem 0.9rem; font-weight:700; }
+    .page-intro {
+        background:#F8FAFC; border-left:4px solid #2E86C1; border-radius:8px;
+        padding:0.85rem 1rem; margin:0.1rem 0 1rem 0; color:#435466;
+    }
+    .archive-tree {
+        background:#FBFCFD; border:1px solid #DDE6EE; border-radius:10px;
+        padding:0.85rem 1rem; font-family:monospace; font-size:0.82rem; color:#34495E;
+    }
     .lims-panel {
         background: #FFFFFF; border: 1px solid #E3E8EE; border-radius: 12px; padding: 1.3rem 1.4rem;
         box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 1.2rem; height: 100%;
@@ -203,6 +224,14 @@ def inject_custom_css():
         border: 2px dashed #2E86C1; border-radius: 10px; padding: 1.4rem; text-align: center;
         background: #F5FAFF; margin-bottom: 1.2rem;
     }
+    .dashboard-header { display:flex; align-items:flex-end; justify-content:space-between; gap:1rem; margin-bottom:1rem; }
+    .dashboard-title { font-size:2.15rem; font-weight:800; color:#16324F; margin:0; letter-spacing:-0.4px; }
+    .dashboard-subtitle { color:#6B7C8F; margin:0.2rem 0 0; font-size:0.9rem; }
+    .live-clock { background:#F5FAFF; border:1px solid #DDEAF4; border-radius:10px; padding:0.65rem 0.85rem; min-width:215px; }
+    .live-clock .label { font-size:0.67rem; text-transform:uppercase; letter-spacing:.5px; color:#7B8794; font-weight:700; }
+    .live-clock .value { font-size:0.98rem; font-weight:800; color:#1B4F72; }
+    .section-kicker { font-size:.72rem; text-transform:uppercase; letter-spacing:.8px; color:#5D7488; font-weight:800; margin-bottom:.35rem; }
+    .archive-summary { border:1px solid #DDE6EE; border-radius:12px; padding:1rem 1.1rem; background:#FBFCFD; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -225,12 +254,9 @@ def render_top_banner(conn, subtitle, notif_count=None):
 
 
 def render_landing_page(conn):
-    render_top_banner(conn, "Blood test results management application")
-    st.markdown(
-        '<div class="welcome-title">Welcome to our software for sharing'
-        ' the results of a blood test</div>',
-        unsafe_allow_html=True,
-    )
+    render_top_banner(conn, "Application for the operational management of blood test results" if tr("Language")=="Language" else "Application de gestion opérationnelle des résultats d'analyses sanguines")
+    welcome = 'Welcome to our software for sharing the results of a blood test' if tr('Language') == 'Language' else "Bienvenue dans notre logiciel de partage des résultats d'analyses sanguines"
+    st.markdown(f'<div class="welcome-title">{welcome}</div>', unsafe_allow_html=True)
     st.markdown(_html("""
     <div class="landing-description">
         This software supports <strong>Clinical Services (CRO)</strong> in the
