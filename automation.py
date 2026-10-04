@@ -147,21 +147,30 @@ def _vinc_period(reference_date):
 
 
 def _vinc_sent_in_period(conn, period):
+    """
+    Returns True when any completed CRO -> Sponsor monthly delivery
+    exists for the requested period.
+
+    A monthly delivery is considered complete when at least one sponsor
+    outbound package for that month has status SENT. This includes:
+    VINC, V1, V2 and CDISC SDTM packages.
+    """
     row = conn.execute(
-        "SELECT 1 FROM EXPORT_PACKAGES WHERE package_type='VINC_MONTHLY_CRO_TO_SPONSOR' "
-        "AND cutoff_date LIKE ? AND status='SENT' LIMIT 1",
+        """
+        SELECT 1
+        FROM EXPORT_PACKAGES
+        WHERE cutoff_date LIKE ?
+          AND status = 'SENT'
+          AND (
+              package_type LIKE '%MONTHLY_CRO_TO_SPONSOR'
+              OR package_type = 'CDISC_SDTM_MONTHLY_CRO_TO_SPONSOR'
+          )
+        LIMIT 1
+        """,
         (f"{period}%",),
     ).fetchone()
-    if row:
-        return True
-    audit_df = read_audit_trail(conn)
-    if audit_df.empty:
-        return False
-    sent = audit_df[
-        (audit_df["action"] == "EXPORT_PACKAGE_SENT")
-        & audit_df["event_timestamp"].astype(str).str.startswith(period)
-    ]
-    return not sent.empty
+
+    return row is not None
 
 
 def _configured_usernames(conn, setting_key):
