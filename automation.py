@@ -556,7 +556,7 @@ def check_and_send_reminders(conn):
     return results
 
 
-def get_weekly_ingestion_compliance(conn, n_weeks=8):
+def get_weekly_ingestion_compliance(conn, n_weeks=38):
     """Show weekly receipt compliance using the business receipt timestamp.
 
     For the training/demo data this timestamp is carried by IMPORT_BATCHES.received_at
@@ -574,6 +574,7 @@ def get_weekly_ingestion_compliance(conn, n_weeks=8):
     ).tz_localize(None) if rows else pd.DatetimeIndex([])
 
     today = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    # Include the current ISO week so W40 remains visible and red until received.
     weeks = pd.period_range(end=today.to_period("W-SUN"), periods=n_weeks, freq="W-SUN")
 
     return pd.DataFrame([
@@ -586,18 +587,20 @@ def get_weekly_ingestion_compliance(conn, n_weeks=8):
     ])
 
 
-def get_monthly_vinc_compliance(conn, n_months=6):
+def get_monthly_vinc_compliance(conn, n_months=10):
     """Show monthly CRO→Sponsor compliance using the package cut-off month.
 
-    SENT VINC_MONTHLY_CRO_TO_SPONSOR packages are matched on EXPORT_PACKAGES.cutoff_date,
-    which is the contractual business period represented by the package. This lets
-    historical/demo packages remain green in their actual month even when the
-    database row was created later.
+    A month is compliant when at least one SENT monthly CRO→Sponsor component exists
+    for that month: VINC, V1, V2 or CDISC SDTM. The contractual period is taken from
+    EXPORT_PACKAGES.cutoff_date, so historical/demo deliveries remain green in their
+    business month even when their database rows were created later.
     """
+    # Any monthly CRO→Sponsor component makes the month compliant:
+    # VINC, V1, V2 or CDISC SDTM.
     rows = conn.execute(
-        "SELECT cutoff_date FROM EXPORT_PACKAGES "
-        "WHERE package_type='VINC_MONTHLY_CRO_TO_SPONSOR' "
-        "AND status='SENT' AND cutoff_date IS NOT NULL "
+        "SELECT cutoff_date, package_type FROM EXPORT_PACKAGES "
+        "WHERE status='SENT' AND cutoff_date IS NOT NULL "
+        "AND package_type LIKE '%_MONTHLY_CRO_TO_SPONSOR' "
         "ORDER BY cutoff_date"
     ).fetchall()
     cutoff_dates = pd.to_datetime(
