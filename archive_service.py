@@ -103,6 +103,33 @@ def archive_document(
     return int(cur.lastrowid)
 
 
+def get_archived_document(conn, archive_id: int):
+    """Return one archived document and its stored binary content."""
+    row = conn.execute(
+        "SELECT archive_id, filename, content, mimetype, sha256, archive_date, "
+        "stakeholder, direction, document_type, related_id, created_by, created_at, description "
+        "FROM ARCHIVE_ENTRIES WHERE archive_id=?",
+        (int(archive_id),),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "archive_id": row[0],
+        "filename": row[1],
+        "content": row[2] or b"",
+        "mimetype": row[3] or "application/octet-stream",
+        "sha256": row[4],
+        "archive_date": row[5],
+        "stakeholder": row[6],
+        "direction": row[7],
+        "document_type": row[8],
+        "related_id": row[9],
+        "created_by": row[10],
+        "created_at": row[11],
+        "description": row[12],
+    }
+
+
 def list_archive(conn, year=None, iso_week=None, stakeholder=None):
     where, params = [], []
     if year is not None:
