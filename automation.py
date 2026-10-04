@@ -21,6 +21,12 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import io
+import zipfile
+import json
+import os
+import hashlib
+
 import pandas as pd
 import streamlit as st
 
