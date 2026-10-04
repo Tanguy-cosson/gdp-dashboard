@@ -19,7 +19,7 @@ PAGE_PERMISSIONS = {
             "Patient Records", "VINC extraction", "Notes", "Export CDISC SDTM",
             "Data Privacy", "Mailbox", "My Account", "Settings", "Automation", "Data Correction / Void",
             "User Management", "Audit Trail", "Guide"],
-    "SPONSOR": ["VINC extraction", "Archive", "Notes", "Mailbox", "My Account", "Guide"],
+    "SPONSOR": ["Dashboard", "VINC extraction", "Archive", "Notes", "Mailbox", "My Account", "Guide"],
 }
 
 # ---------------------------------------------------------------------

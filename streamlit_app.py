@@ -928,6 +928,188 @@ def render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive
                                         )
 
 
+def page_dashboard(conn):
+    """Executive CRO dashboard with real-time clock, KPIs, charts, alerts,
+    contractual cadence and weekly document archive browser."""
+    df = read_full_results(conn)
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+
+    st.markdown(_html(f"""
+    <div class="dashboard-header">
+      <div>
+        <div class="section-kicker">BLOOD Study · CRO operational control</div>
+        <div class="dashboard-title">{tr('Dashboard')}</div>
+        <p class="dashboard-subtitle">{tr('Real-time overview')}</p>
+      </div>
+      <div class="live-clock">
+        <div class="label">{tr('Local time')}</div>
+        <div class="value">{now_local.strftime('%d %b %Y · %H:%M:%S %Z')}</div>
+        <div class="label" style="margin-top:.3rem;">{tr('UTC time')}</div>
+        <div class="value" style="font-size:.84rem;">{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}</div>
+      </div>
+    </div>
+    """), unsafe_allow_html=True)
+
+    st.caption(f"Last dashboard refresh: {now_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    render_critical_alert_banner(conn)
+    with st.container(border=True):
+        render_central_lab_reminder(conn)
+        render_sponsor_reminder(conn)
+
+    if df.empty:
+        st.info("No data available. Start with Data Ingestion to receive the Central Laboratory weekly file.")
+        return
+
+    df = compute_oor_flag(df)
+    n_total = len(df)
+    n_patients = df["usubjid"].nunique()
+    n_sites = df["site_id"].nunique()
+    n_reviewed = int((df["status"] == "REVIEWED").sum())
+    n_pending = int((df["status"] == "PENDING").sum())
+    n_tech = int((df["status"] == "TECHNICAL_OK").sum())
+    n_critical_pending = int(((df["Alerte"] == CRITICAL_FLAG) & (df["status"] != "REVIEWED") & (df["record_status"] == "ACTIVE")).sum())
+    review_pct = round((n_reviewed / n_total) * 100, 1) if n_total else 0
+    archive_years = available_archive_years(conn)
+
+    cards = "".join([
+        kpi_card(tr("Total results"), n_total, "🧪", "#2E86C1"),
+        kpi_card(tr("Patients"), n_patients, "👤", "#1B4F72"),
+        kpi_card(tr("Sites"), n_sites, "🏥", "#3498DB"),
+        kpi_card(tr("Reviewed"), f"{review_pct}%", "✅", "#2E8B57"),
+        kpi_card(tr("Critical pending"), n_critical_pending, "🔴", "#A93226"),
+    ])
+    st.markdown(_html(f'<div class="kpi-grid">{cards}</div>'), unsafe_allow_html=True)
+
+    tat_tech, tat_bio = compute_tat_hours(df)
+    tat_tech_txt = f"{tat_tech:.1f} h" if tat_tech is not None else "n/a"
+    tat_bio_txt = f"{tat_bio:.1f} h" if tat_bio is not None else "n/a"
+    st.markdown(_html(f"""<div class="lims-panel">
+      <h4>{tr('Validation progress')}</h4>
+      <div class="funnel-row">
+        <div class="funnel-stage"><div class="funnel-count">{n_pending}</div><div class="funnel-label">Awaiting technician</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{n_tech}</div><div class="funnel-label">Awaiting biologist</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{n_reviewed}</div><div class="funnel-label">Reviewed</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{tat_tech_txt}</div><div class="funnel-label">Receipt → technical</div></div>
+        <div class="funnel-stage"><div class="funnel-count">{tat_bio_txt}</div><div class="funnel-label">Technical → biological</div></div>
+      </div>
+    </div>"""), unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    status = df.groupby("status").size().reset_index(name="Count")
+    fig = px.pie(status, names="status", values="Count", hole=0.62,
+                 title=f"<b>{tr('Validation progress')}</b>", color="status",
+                 color_discrete_map={"PENDING":"#B9C6D2","TECHNICAL_OK":"#5B9BD5","REVIEWED":"#55A868"})
+    fig.update_layout(height=350, margin=dict(l=20,r=20,t=55,b=15), legend_title_text="")
+    with c1: st.plotly_chart(fig, use_container_width=True)
+
+    alert_df = df.copy()
+    alert_df["Alert class"] = alert_df["Alerte"].map({NORMAL_FLAG:"NORMAL", OOR_FLAG:"OUT-OF-RANGE", CRITICAL_FLAG:"CRITICAL"}).fillna("UNCLASSIFIED")
+    alert_df = alert_df.groupby("Alert class").size().reset_index(name="Count")
+    fig2 = px.bar(alert_df, x="Alert class", y="Count", color="Alert class",
+                  title=f"<b>{tr('Alerts distribution')}</b>", text_auto=True,
+                  color_discrete_map={"NORMAL":"#55A868","OUT-OF-RANGE":"#E6A23C","CRITICAL":"#C84B3A","UNCLASSIFIED":"#9AA5B1"})
+    fig2.update_layout(height=350, margin=dict(l=20,r=20,t=55,b=15), showlegend=False, xaxis_title=None, yaxis_title="Results")
+    with c2: st.plotly_chart(fig2, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    visit_data = df.groupby(["visit_code","test_code"]).size().reset_index(name="Count")
+    fig3 = px.bar(visit_data, x="visit_code", y="Count", color="test_code", barmode="stack",
+                  title=f"<b>{tr('Results by visit')}</b>", text_auto=True)
+    fig3.update_layout(height=360, margin=dict(l=20,r=20,t=55,b=15), xaxis_title=None, yaxis_title="Results")
+    with c3: st.plotly_chart(fig3, use_container_width=True)
+
+    tmp = df.copy()
+    tmp["result_date_dt"] = pd.to_datetime(tmp["result_date"], errors="coerce")
+    weekly_results = tmp.dropna(subset=["result_date_dt"]).assign(week=lambda x: x["result_date_dt"].dt.to_period("W-SUN").dt.start_time).groupby("week").size().reset_index(name="Count")
+    if weekly_results.empty:
+        weekly_results = pd.DataFrame({"week":[pd.Timestamp.now().normalize()],"Count":[len(df)]})
+    fig4 = px.line(weekly_results, x="week", y="Count", markers=True, title=f"<b>{tr('Results over time')}</b>")
+    fig4.update_layout(height=360, margin=dict(l=20,r=20,t=55,b=15), xaxis_title=None, yaxis_title="Results")
+    with c4: st.plotly_chart(fig4, use_container_width=True)
+
+    st.markdown("---")
+    left, right = st.columns([1.15,1])
+    with left:
+        st.subheader(tr("Recent critical alerts"))
+        crit = df[(df["Alerte"] == CRITICAL_FLAG) & (df["status"] != "REVIEWED") & (df["record_status"] == "ACTIVE")]
+        if crit.empty:
+            st.success("No unresolved critical result currently pending review.")
+        else:
+            st.dataframe(crit[["result_id","usubjid","visit_code","test_code","result_value","result_unit","status"]].sort_values("result_id", ascending=False).head(10), use_container_width=True, hide_index=True)
+    with right:
+        st.subheader(tr("Recent system activity"))
+        audit_df = read_audit_trail(conn)
+        if audit_df.empty:
+            st.info("No audit events have been recorded yet.")
+        else:
+            st.dataframe(audit_df.head(8)[["action","user_name","event_timestamp","record_ref"]], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader(tr("Contractual cadence"))
+    a, b = st.columns(2)
+    with a:
+        st.markdown(f"**{tr('Weekly lab → CRO')}**")
+        st.dataframe(get_weekly_ingestion_compliance(conn, n_weeks=8), use_container_width=True, hide_index=True)
+    with b:
+        st.markdown(f"**{tr('Monthly CRO → sponsor')}**")
+        st.dataframe(get_monthly_vinc_compliance(conn, n_months=6), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    render_cro_archive_explorer(conn, section_key="dashboard_cro_archive")
+
+    st.markdown("---")
+    render_sponsor_archive_explorer(conn, section_key="dashboard_sponsor_archive")
+
+
+
+def page_sponsor_dashboard(conn):
+    """Read-only sponsor dashboard: only sponsor-authorized deliveries are shown."""
+    sponsor_df = list_sponsor_archive(conn, sponsor_only=True)
+    now_local = datetime.now().astimezone()
+    st.markdown(_html(f"""
+    <div class="dashboard-header">
+      <div>
+        <div class="section-kicker">BLOOD Study · LPH sponsor portal</div>
+        <div class="dashboard-title">LPH Sponsor Dashboard</div>
+        <p class="dashboard-subtitle">Read-only view of received study deliverables</p>
+      </div>
+      <div class="live-clock">
+        <div class="label">Local time</div>
+        <div class="value">{now_local.strftime('%d %b %Y · %H:%M:%S %Z')}</div>
+      </div>
+    </div>
+    """), unsafe_allow_html=True)
+
+    if sponsor_df.empty:
+        st.info("No sponsor-visible deliverables have been received yet. Open Archive and Mailbox after the next CRO delivery.")
+        return
+
+    total = len(sponsor_df)
+    months = sponsor_df[['calendar_year', 'month']].drop_duplicates().shape[0]
+    counts = sponsor_df.groupby('document_type').size().to_dict()
+    latest = sponsor_df['archive_date'].max()
+
+    cards = ''.join([
+        kpi_card("Received deliverables", total, "📦", "#2E86C1"),
+        kpi_card("Delivery months", months, "🗓️", "#1B4F72"),
+        kpi_card("Latest delivery", latest, "📅", "#3498DB"),
+        kpi_card("VINC / V1 / V2 / SDTM", sum(counts.get(k, 0) for k in ('VINC_PACKAGE','V1_PACKAGE','V2_PACKAGE','CDISC_SDTM')), "🧬", "#2E8B57"),
+    ])
+    st.markdown(_html(f'<div class="kpi-grid">{cards}</div>'), unsafe_allow_html=True)
+
+    st.markdown('---')
+    st.subheader("Recent sponsor deliveries")
+    cols = [c for c in ['archive_date','document_type','filename','sha256','description'] if c in sponsor_df.columns]
+    st.dataframe(sponsor_df[cols].head(20), use_container_width=True, hide_index=True)
+
+    st.markdown('---')
+    st.subheader("Monthly CRO → Sponsor cadence")
+    st.dataframe(get_monthly_vinc_compliance(conn, n_months=6), use_container_width=True, hide_index=True)
+
+    st.caption("This dashboard does not expose the CRO operational archive, laboratory source files, HL7 messages, internal automation reports or CRO-only audit information.")
+
+
 def page_archive(conn, user_name, role):
     """Dedicated archive explorer page.
 
@@ -2014,7 +2196,10 @@ def main():
     elif page == "Biological Validation":
         page_biological_validation(conn, username)
     elif page == "Dashboard":
-        page_dashboard(conn)
+        if role == "SPONSOR":
+            page_sponsor_dashboard(conn)
+        else:
+            page_dashboard(conn)
     elif page == "Archive":
         page_archive(conn, username, role)
     elif page == "Process Flow":
