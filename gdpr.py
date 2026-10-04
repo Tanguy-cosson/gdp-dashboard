@@ -1,20 +1,22 @@
 """
-gdpr.py — Droits RGPD au niveau applicatif.
+gdpr.py — contrôles RGPD au niveau applicatif pour le prototype BLOOD.
 
-Important, à ne pas perdre de vue : ce module rapproche l'application
-de la conformité RGPD (droit d'accès, minimisation, journal de
-consentement), mais ne remplace pas l'obligation d'héberger de
-véritables données de santé chez un hébergeur certifié HDS. Voir le
-README pour ce point.
+Ce module montre trois mécanismes de démonstration :
+- droit d'accès / export des données ;
+- pseudonymisation applicative ;
+- journalisation du statut d'un événement de consentement.
 
-Note sur le "droit à l'effacement" en essai clinique : les données
-d'un essai clinique sont soumises à des obligations légales de
-conservation (généralement de l'ordre de 15 à 25 ans selon le type
-d'essai) qui priment sur une suppression immédiate à la demande du
-patient. La bonne pratique n'est donc PAS de supprimer le dossier,
-mais de le PSEUDONYMISER (retirer/généraliser les identifiants
-indirects) tout en conservant les données cliniques nécessaires à
-l'intégrité de l'essai — c'est ce qu'implémente `anonymize_patient`.
+Ces mécanismes ne constituent pas, à eux seuls, une conformité RGPD
+complète. La gouvernance doit également définir le responsable de
+traitement, les bases juridiques, l'information des personnes, les durées
+de conservation, la sécurité, les contrats sous-traitants, les transferts
+et la gestion des demandes de droits.
+
+Point important pour un essai clinique : le consentement éclairé à la
+participation à l'essai ne doit pas être présenté automatiquement comme la
+base juridique RGPD du traitement des données. Le prototype conserve donc
+une trace de statut de consentement sans prétendre déterminer la base
+juridique de l'étude.
 """
 from db import now_utc_iso, read_full_results, read_remarks
 from audit import log_audit

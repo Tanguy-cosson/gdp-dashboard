@@ -133,8 +133,27 @@ def available_archive_weeks(conn, year):
     ).fetchall()]
 
 
-def list_sponsor_archive(conn, year=None, quarter=None, month=None, stakeholder=None):
-    """List sponsor-facing artefacts using calendar year/quarter/month filters."""
+# Only artefacts that the sponsor is contractually allowed to receive are exposed
+# through the sponsor archive.  Internal CRO material remains in the CRO archive.
+SPONSOR_VISIBLE_DOCUMENT_TYPES = {
+    "VINC_PACKAGE",
+    "VINC_PDF",
+    "V1_PACKAGE",
+    "V2_PACKAGE",
+    "CDISC_SDTM",
+}
+
+
+def list_sponsor_archive(
+    conn, year=None, quarter=None, month=None, stakeholder=None, sponsor_only=False
+):
+    """List sponsor-facing artefacts using calendar year/quarter/month filters.
+
+    When ``sponsor_only`` is True, only actual sponsor deliverables are returned:
+    outbound Clinical Services packages of an approved document type.  Internal
+    CRO automation reports, inbound laboratory files, HL7 messages and other
+    operational documents are excluded.
+    """
     df = pd.read_sql_query(
         "SELECT archive_id, archive_date, stakeholder, direction, document_type, filename, "
         "sha256, related_id, created_by, created_at, description FROM ARCHIVE_ENTRIES "
@@ -142,7 +161,13 @@ def list_sponsor_archive(conn, year=None, quarter=None, month=None, stakeholder=
         conn,
     )
     if df.empty:
-        return df.assign(quarter=pd.Series(dtype="Int64"), month=pd.Series(dtype="Int64"), logical_path=pd.Series(dtype=str))
+        return df.assign(
+            calendar_year=pd.Series(dtype="Int64"),
+            quarter=pd.Series(dtype="Int64"),
+            month=pd.Series(dtype="Int64"),
+            logical_path=pd.Series(dtype=str),
+        )
+
     dates = pd.to_datetime(df["archive_date"], errors="coerce")
     df["calendar_year"] = dates.dt.year
     df["quarter"] = ((dates.dt.month - 1) // 3) + 1
@@ -153,8 +178,25 @@ def list_sponsor_archive(conn, year=None, quarter=None, month=None, stakeholder=
             df["archive_date"], df["stakeholder"], df["direction"], df["document_type"], df["filename"]
         )
     ]
-    # Sponsor view focuses on outbound packages and sponsor receipt copies.
-    df = df[df["stakeholder"].isin(["Clinical_Services", "LPH_Sponsor"])]
+
+    if sponsor_only:
+        # Sponsor receives outbound Clinical Services deliverables only.  This
+        # is deliberately allow-list based rather than deny-list based.
+        df = df[
+            (df["stakeholder"] == "Clinical_Services")
+            & (df["direction"] == "OUTBOUND")
+            & (df["document_type"].isin(SPONSOR_VISIBLE_DOCUMENT_TYPES))
+        ]
+    else:
+        # CRO's sponsor-facing repository is still restricted to the same
+        # sponsor-deliverable allow-list.  The CRO's operational archive is the
+        # separate list_archive() view.
+        df = df[
+            (df["stakeholder"] == "Clinical_Services")
+            & (df["direction"] == "OUTBOUND")
+            & (df["document_type"].isin(SPONSOR_VISIBLE_DOCUMENT_TYPES))
+        ]
+
     if year is not None:
         df = df[df["calendar_year"] == int(year)]
     if quarter is not None:
@@ -165,36 +207,6 @@ def list_sponsor_archive(conn, year=None, quarter=None, month=None, stakeholder=
         df = df[df["stakeholder"] == stakeholder]
     return df.reset_index(drop=True)
 
-
-
-def get_archived_document(conn, archive_id: int):
-    """Return one archived artefact, including content, for UI download."""
-    row = conn.execute(
-        """
-        SELECT archive_id, filename, content, mimetype, sha256,
-               archive_date, stakeholder, direction, document_type,
-               created_by, created_at, description
-        FROM ARCHIVE_ENTRIES
-        WHERE archive_id=?
-        """,
-        (int(archive_id),),
-    ).fetchone()
-    if not row:
-        return None
-    return {
-        "archive_id": int(row[0]),
-        "filename": row[1],
-        "content": row[2] or b"",
-        "mimetype": row[3] or "application/octet-stream",
-        "sha256": row[4],
-        "archive_date": row[5],
-        "stakeholder": row[6],
-        "direction": row[7],
-        "document_type": row[8],
-        "created_by": row[9],
-        "created_at": row[10],
-        "description": row[11],
-    }
 
 def available_sponsor_years(conn):
     df = list_sponsor_archive(conn)
