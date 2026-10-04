@@ -1,8 +1,8 @@
 """BLOOD LIMS V14 historical demo loader: weekly W03-W39 + Jan-Aug sponsor deliveries.
 
 Demo-only extension: automatically assigns every imported historical demo sample to
-one of three freezer racks (R01, A01, B01), each using a 96-well demo box. Manual
-imports are NOT auto-stored; only this training-history loader performs the placement.
+one of three freezer racks (R01, A01, B01), each using four demo boxes (one per rack level), with a maximum of 8 samples per box.
+Manual imports are NOT auto-stored; only this training-history loader performs the placement.
 """
 from __future__ import annotations
 
@@ -33,12 +33,10 @@ HISTORY_DIR = BASE_DIR / "demo_data_v14" / "history"
 # Demo-only physical storage convention
 # ---------------------------------------------------------------------------
 DEMO_RACKS = ("R01", "A01", "B01")
-DEMO_BOX_PREFIX = {"R01": "R01-BOX01", "A01": "A01-BOX01", "B01": "B01-BOX01"}
 DEMO_FREEZER = "FREEZER-80C-01"
-DEMO_BOX_CAPACITY = 96
-
-# Standard 96-well plate order: A01..H12.
-DEMO_WELLS = [f"{row}{col:02d}" for row in "ABCDEFGH" for col in range(1, 13)]
+DEMO_LEVELS_PER_RACK = 4
+DEMO_BOX_CAPACITY = 8
+DEMO_WELLS = [f"A{col:02d}" for col in range(1, DEMO_BOX_CAPACITY + 1)]
 
 
 def _empty_result_state(conn) -> bool:
@@ -74,9 +72,10 @@ def _sample_demo_storage_exists(conn, sample_id: str) -> bool:
 def _auto_store_demo_samples(conn) -> dict:
     """Place historical demo samples only into R01/A01/B01.
 
-    Allocation is deterministic by receipt date and sample_id, so repeated
-    demonstrations produce a clean and reproducible Storage Map. One 96-well
-    demo box is used per rack. The function only touches samples with no prior
+    Allocation is deterministic by receipt date and sample_id. Each rack has
+    exactly four levels/boxes, all four are populated as evenly as possible,
+    each box holds at most 8 samples, and positions A01..A08 are unique
+    within each box. The function only touches samples with no prior
     STORAGE_LOCATIONS row, so it never overwrites a manual placement.
     """
     samples = pd.read_sql_query(
@@ -93,11 +92,26 @@ def _auto_store_demo_samples(conn) -> dict:
     )
 
     if samples.empty:
-        return {"placed": 0, "already_stored": 0, "by_rack": {rack: 0 for rack in DEMO_RACKS}}
+        empty_levels = {
+            f"{rack}-BOX{level:02d}": 0
+            for rack in DEMO_RACKS
+            for level in range(1, DEMO_LEVELS_PER_RACK + 1)
+        }
+        return {
+            "placed": 0,
+            "already_stored": 0,
+            "by_rack": {rack: 0 for rack in DEMO_RACKS},
+            "by_rack_and_level": empty_levels,
+        }
 
     rack_counts = {rack: 0 for rack in DEMO_RACKS}
+    box_counts = {(rack, level): 0 for rack in DEMO_RACKS for level in range(1, DEMO_LEVELS_PER_RACK + 1)}
     placed = 0
     skipped = 0
+
+    # Round-robin by rack, then round-robin through the four levels.
+    # This keeps all four boxes visible in the demo and avoids overfilled boxes.
+    capacity_per_rack = DEMO_LEVELS_PER_RACK * DEMO_BOX_CAPACITY
 
     for idx, row in samples.iterrows():
         sample_id = str(row["sample_id"])
@@ -105,14 +119,23 @@ def _auto_store_demo_samples(conn) -> dict:
             skipped += 1
             continue
 
-        rack = DEMO_RACKS[placed % len(DEMO_RACKS)]
+        rack_index = placed % len(DEMO_RACKS)
+        rack = DEMO_RACKS[rack_index]
         within_rack_index = rack_counts[rack]
-        if within_rack_index >= DEMO_BOX_CAPACITY:
+        if within_rack_index >= capacity_per_rack:
             raise RuntimeError(
-                f"Demo storage capacity exceeded for rack {rack} ({DEMO_BOX_CAPACITY} positions)."
+                f"Demo storage capacity exceeded for rack {rack} "
+                f"({DEMO_LEVELS_PER_RACK} levels x {DEMO_BOX_CAPACITY} samples)."
             )
-        well = DEMO_WELLS[within_rack_index]
-        box = DEMO_BOX_PREFIX[rack]
+
+        level = within_rack_index % DEMO_LEVELS_PER_RACK + 1
+        position_index = box_counts[(rack, level)]
+        if position_index >= DEMO_BOX_CAPACITY:
+            raise RuntimeError(
+                f"Demo storage capacity exceeded for box {rack}-BOX{level:02d}."
+            )
+        box = f"{rack}-BOX{level:02d}"
+        well = DEMO_WELLS[position_index]
         volume = _demo_volume_ul(row["sample_type"])
 
         add_storage_location(
@@ -133,9 +156,27 @@ def _auto_store_demo_samples(conn) -> dict:
         conn.commit()
 
         rack_counts[rack] += 1
+        box_counts[(rack, level)] += 1
         placed += 1
 
-    return {"placed": placed, "already_stored": skipped, "by_rack": rack_counts}
+    by_rack = dict(rack_counts)
+    by_rack_and_level = {}
+    for rack in DEMO_RACKS:
+        for level in range(1, DEMO_LEVELS_PER_RACK + 1):
+            count = conn.execute(
+                """
+                SELECT COUNT(*) FROM STORAGE_LOCATIONS
+                WHERE freezer_id=? AND rack_id=? AND box_id=?
+                """,
+                (DEMO_FREEZER, rack, f"{rack}-BOX{level:02d}"),
+            ).fetchone()[0]
+            by_rack_and_level[f"{rack}-BOX{level:02d}"] = int(count)
+    return {
+        "placed": placed,
+        "already_stored": skipped,
+        "by_rack": by_rack,
+        "by_rack_and_level": by_rack_and_level,
+    }
 
 
 def load_demo_history(conn):
@@ -241,7 +282,8 @@ def load_demo_history(conn):
         "system",
         comment=(
             f"weekly W03-W39; files={batches}; rows={total_rows}; reviewed={reviewed}; "
-            f"auto_storage={storage_summary['placed']}; rack_counts={rack_text}; sponsor_months=Jan-Aug"
+            f"auto_storage={storage_summary['placed']}; rack_counts={rack_text}; "
+            f"rack_levels={storage_summary['by_rack_and_level']}; sponsor_months=Jan-Aug"
         ),
     )
     return {
@@ -256,6 +298,7 @@ def load_demo_history(conn):
         "reviewed": reviewed,
         "auto_stored": storage_summary["placed"],
         "storage_by_rack": storage_summary["by_rack"],
+        "storage_by_rack_and_level": storage_summary["by_rack_and_level"],
         "monthly_runs": monthly_runs,
     }
 
